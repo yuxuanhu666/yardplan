@@ -21,12 +21,15 @@ Structure (single-file, layered):
   Section J: Allocation Engine (orchestrates Stage 1 + 2)
   Section K: Result Formatter
   Section L: Planner Entry Point
-  Section M: Sample Data & Main Runner
+  Section M: Main Runner
+  Section O: TOS Data Loader
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import uuid
 from abc import ABC, abstractmethod
 from collections import defaultdict
@@ -34,6 +37,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum, auto
 from typing import Any, Callable, Dict, List, Optional, Tuple, Set
+
+_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1140,6 +1145,220 @@ class AllocationEngine:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Section N: YardSpace Integration Adapter
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class YardSpaceAdapter:
+    """
+    将 YardSpace (槽位级别的实时状态) 转换为规划引擎所需的 YardArea/Bay 对象。
+
+    映射规则
+    --------
+    YardSpace                          →  yardplan
+    ─────────────────────────────────────────────────────────
+    blockId                            →  YardArea.area_id
+    奇数 bayIdx 的 stack 列             →  Bay (is_in_large_bay=False)
+    偶数 bayIdx 的 stack 列             →  LargeBayPair
+    next_placeable_tier is not None    →  free column (可再放箱的 stack)
+    next_placeable_tier is None        →  occupied column (已满 stack)
+
+    使用示例
+    --------
+        from useable_space import YardSpace
+        yard = YardSpace.load()
+        btypes = {"B01": BusinessType.IMPORT, "B02": BusinessType.EXPORT}
+        planner = YardPlanner()
+        result = planner.plan_with_yard_space(
+            yard, containers, btypes, apply_to_yard=True
+        )
+    """
+
+    @staticmethod
+    def build_yard_areas(
+        yard: Any,
+        block_business_types: Dict[str, BusinessType],
+        block_ids: Optional[List[str]] = None,
+    ) -> Tuple[List[YardArea], Dict[str, list]]:
+        """
+        从 YardSpace 实例构建 YardArea 列表。
+
+        Parameters
+        ----------
+        yard                 : YardSpace 实例
+        block_business_types : blockId -> BusinessType 映射 (进/出口属性由外部配置提供)
+        block_ids            : 仅处理指定 block, None 表示全部
+
+        Returns
+        -------
+        (yard_areas, slot_registry)
+            slot_registry: bay_id/pair_id -> [(stack_key, stack_info), ...]
+            供后续精细化槽位分配时使用
+        """
+        # 按 blockId 分组 stacks
+        blocks: Dict[str, dict] = defaultdict(dict)
+        for (bid, bay_idx, stk_idx), sinfo in yard.stacks.items():
+            blocks[bid][(bay_idx, stk_idx)] = sinfo
+
+        slot_registry: Dict[str, list] = {}
+        yard_areas: List[YardArea] = []
+
+        target_blocks = block_ids if block_ids else sorted(blocks.keys())
+
+        for block_id in target_blocks:
+            if block_id not in blocks:
+                continue
+            btype = block_business_types.get(block_id, BusinessType.IMPORT)
+            stack_dict = blocks[block_id]
+
+            # 按 bayIdx 分组
+            bay_groups: Dict[int, list] = defaultdict(list)
+            for (bay_idx, stk_idx), sinfo in stack_dict.items():
+                bay_groups[bay_idx].append(((block_id, bay_idx, stk_idx), sinfo))
+
+            sorted_bay_idxs = sorted(bay_groups.keys())
+
+            bays: List[Bay] = []
+            large_bay_pairs: List[LargeBayPair] = []
+
+            for bay_idx in sorted_bay_idxs:
+                stacks_in_bay = bay_groups[bay_idx]
+                total = len(stacks_in_bay)
+                # free_columns: 该 bayIdx 下 next_placeable_tier 不为 None 的 stack 数量
+                free = sum(
+                    1 for _, sinfo in stacks_in_bay
+                    if sinfo.get("next_placeable_tier") is not None
+                )
+                occupied = total - free
+                is_edge = (
+                    bay_idx == sorted_bay_idxs[0] or bay_idx == sorted_bay_idxs[-1]
+                )
+
+                if bay_idx % 2 == 1:
+                    # ── 奇数 bayIdx → 20ft Bay ──────────────────────────────
+                    bay_obj = Bay(
+                        bay_id=f"{block_id}-{bay_idx}",
+                        bay_number=bay_idx,
+                        yard_area_id=block_id,
+                        total_columns=total,
+                        occupied_columns=occupied,
+                        is_in_large_bay=False,
+                    )
+                    bays.append(bay_obj)
+                    slot_registry[bay_obj.bay_id] = stacks_in_bay
+
+                else:
+                    # ── 偶数 bayIdx → 40ft LargeBayPair ─────────────────────
+                    # 用两个同值 Bay 表示大贝位的对称结构:
+                    #   LargeBayPair.total_columns   = min(a.total, b.total)  = total
+                    #   LargeBayPair.occupied_columns = max(a.occ, b.occ)    = occupied
+                    #   LargeBayPair.free_columns     = total - occupied
+                    bay_a = Bay(
+                        bay_id=f"{block_id}-{bay_idx}-A",
+                        bay_number=bay_idx,
+                        yard_area_id=block_id,
+                        total_columns=total,
+                        occupied_columns=occupied,
+                        is_in_large_bay=True,
+                    )
+                    bay_b = Bay(
+                        bay_id=f"{block_id}-{bay_idx}-B",
+                        bay_number=bay_idx + 1,
+                        yard_area_id=block_id,
+                        total_columns=total,
+                        occupied_columns=occupied,
+                        is_in_large_bay=True,
+                    )
+                    pair = LargeBayPair(
+                        pair_id=f"{block_id}-40-{bay_idx}",
+                        yard_area_id=block_id,
+                        bay_a=bay_a,
+                        bay_b=bay_b,
+                        is_edge_pair=is_edge,
+                    )
+                    large_bay_pairs.append(pair)
+                    slot_registry[pair.pair_id] = stacks_in_bay
+
+            area = YardArea(
+                area_id=block_id,
+                business_type=btype,
+                bays=bays,
+                large_bay_pairs=large_bay_pairs,
+                max_stack_height=MAX_TIERS_PER_COLUMN,
+            )
+            yard_areas.append(area)
+
+        logger.info(
+            f"YardSpaceAdapter: 构建了 {len(yard_areas)} 个 YardArea "
+            f"(20ft Bay: {sum(len(a.bays) for a in yard_areas)}, "
+            f"40ft LargeBayPair: {sum(len(a.large_bay_pairs) for a in yard_areas)})"
+        )
+        return yard_areas, slot_registry
+
+    @staticmethod
+    def apply_allocation(
+        result: "PlanningResult",
+        yard: Any,
+    ) -> Dict[str, str]:
+        """
+        将规划结果映射到 YardSpace 中的具体槽位并提交占位。
+
+        对每个已分配 AllocationGroup:
+          - 20ft 箱 → 调用 yard.get_placeable_20ft(block_id) 取槽
+          - 40/45ft 箱 → 调用 yard.get_placeable_40ft(block_id) 取槽
+          - 调用 yard.place_container() 实时写入状态
+
+        每次放箱后立即重新查询可用位, 确保后续分配基于最新状态。
+
+        Parameters
+        ----------
+        result : PlanningResult (须含 allocation_groups + bay_column_allocations)
+        yard   : YardSpace 实例
+
+        Returns
+        -------
+        {container_id -> assigned_full_slot_name}
+        """
+        group_by_id: Dict[str, AllocationGroup] = {
+            g.group_id: g for g in result.allocation_groups
+        }
+        assignment_map: Dict[str, str] = {}
+
+        for alloc in result.bay_column_allocations:
+            group = group_by_id.get(alloc.group_id)
+            if group is None:
+                continue
+            block_id = alloc.yard_area_id
+
+            is_large = alloc.size in (ContainerSize.SIZE_40, ContainerSize.SIZE_45)
+            size_int = {
+                ContainerSize.SIZE_20: 1,
+                ContainerSize.SIZE_40: 2,
+                ContainerSize.SIZE_45: 3,
+            }.get(alloc.size, 1)
+
+            for container in group.containers:
+                # 每次放箱后重新查询, 保证状态最新
+                pool = (
+                    yard.get_placeable_40ft(block_id=block_id)
+                    if is_large
+                    else yard.get_placeable_20ft(block_id=block_id)
+                )
+                if not pool:
+                    logger.warning(
+                        f"Block {block_id} 无可用槽位, 容器 {container.container_id} 未能分配"
+                    )
+                    break
+                slot_name = pool[0]["fullSlotName"]
+                yard.place_container(slot_name, container.container_id, size_int)
+                assignment_map[container.container_id] = slot_name
+
+        logger.info(
+            f"YardSpaceAdapter.apply_allocation: 共分配 {len(assignment_map)} 个容器"
+        )
+        return assignment_map
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Section K: Result Formatter
 # ═══════════════════════════════════════════════════════════════
 
@@ -1238,98 +1457,388 @@ class YardPlanner:
         self.formatter.print_summary(result)
         return result
 
+    def plan_with_yard_space(
+        self,
+        yard: Any,
+        containers: List[Container],
+        block_business_types: Dict[str, BusinessType],
+        block_ids: Optional[List[str]] = None,
+        mode: PlannerMode = PlannerMode.FULL_PLAN,
+        apply_to_yard: bool = False,
+        horizon_start: Optional[datetime] = None,
+        horizon_end: Optional[datetime] = None,
+    ) -> PlanningResult:
+        """
+        使用 YardSpace 提供的实际堆场状态数据进行规划。
+
+        取代原有的手动构造 YardArea 方式, 自动从 YardSpace 读取当前占位情况,
+        计算每个 block 的可用列容量, 并驱动两阶段规划引擎。
+
+        Parameters
+        ----------
+        yard                 : YardSpace 实例 (来自 useable_space.YardSpace.load())
+        containers           : 待规划的 Container 列表
+        block_business_types : {blockId: BusinessType} — 各 block 的进/出口属性
+                               (YardSpace 中不含此信息, 须由外部配置提供)
+        block_ids            : 仅使用指定 block 参与规划, None 表示全部
+        mode                 : PlannerMode (GROUP_ONLY / ALLOCATE_ONLY / FULL_PLAN)
+        apply_to_yard        : True → 规划完成后调用 YardSpace.place_container()
+                               将分配结果写回实际状态, 槽位映射存入 result.metrics
+        horizon_start/end    : 规划时间窗口 (可选, 不提供则自动从 containers 推断)
+
+        Returns
+        -------
+        PlanningResult
+            result.metrics["slot_assignments"] 在 apply_to_yard=True 时包含
+            {container_id -> fullSlotName} 映射
+        """
+        yard_areas, _slot_registry = YardSpaceAdapter.build_yard_areas(
+            yard, block_business_types, block_ids
+        )
+        result = self.plan(
+            containers=containers,
+            yard_areas=yard_areas,
+            mode=mode,
+            horizon_start=horizon_start,
+            horizon_end=horizon_end,
+        )
+        if apply_to_yard:
+            assignments = YardSpaceAdapter.apply_allocation(result, yard)
+            result.metrics["slot_assignments"] = assignments
+            logger.info(
+                f"已将规划结果写回 YardSpace: {len(assignments)} 个容器获得槽位"
+            )
+        return result
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Section M: Minimal Sample Input & Runner
+# Section O: TOS Data Loader
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TOSLoader:
+    """
+    从 TOS 接口下载的 JSON 文件中加载规划所需数据。
+
+    数据来源
+    --------
+    - 217getVesselVisit（船舶访问计划）.json  : 船舶艘次信息 (eta/etd 等)
+    - 217getBoundList（装船箱和卸船箱列表）.json : 箱子与艘次的绑定信息
+
+    卸船箱（进口箱）过滤条件（取自 Inbound 列表）
+    ----------------------------------------
+    - visitId   in visit_ids   : 匹配目标艘次号
+    - boundType == 2           : 进入堆场方向
+    - visitType == 1           : 来自船舶（非进闸）
+    """
+
+    # containerISO 后缀 → ContainerType
+    _ISO_TYPE_MAP: Dict[str, ContainerType] = {
+        "RF": ContainerType.REEFER,
+        "OT": ContainerType.OPEN_TOP,
+        "PL": ContainerType.FLAT_RACK,
+        "FR": ContainerType.FLAT_RACK,
+        "TK": ContainerType.TANK,
+    }
+
+    # containerSize (int from TOS) → ContainerSize enum
+    _SIZE_MAP: Dict[int, ContainerSize] = {
+        1: ContainerSize.SIZE_20,
+        2: ContainerSize.SIZE_40,
+        3: ContainerSize.SIZE_45,
+    }
+
+    # 重箱判定阈值 (kg), 超过此值视为重箱
+    HEAVY_WEIGHT_THRESHOLD: float = 20000.0
+
+    def __init__(
+        self,
+        vessel_visit_path: Optional[str] = None,
+        bound_list_path: Optional[str] = None,
+    ):
+        self.vessel_visit_path = vessel_visit_path or os.path.join(
+            _DATA_DIR, "217getVesselVisit（船舶访问计划）.json"
+        )
+        self.bound_list_path = bound_list_path or os.path.join(
+            _DATA_DIR, "217getBoundList（装船箱和卸船箱列表）.json"
+        )
+
+    # ------------------------------------------------------------------ load
+
+    def load_vessels(self, visit_ids: List[str]) -> Dict[str, Vessel]:
+        """
+        从 VesselVisit JSON 加载目标艘次号对应的船舶信息。
+
+        Parameters
+        ----------
+        visit_ids : 目标艘次号列表 (对应 vesselVisitId 字段)
+
+        Returns
+        -------
+        {vesselVisitId -> Vessel}
+        """
+        with open(self.vessel_visit_path, "r", encoding="utf-8") as f:
+            raw: List[dict] = json.load(f)
+
+        target_set = set(visit_ids)
+        vessels: Dict[str, Vessel] = {}
+
+        for item in raw:
+            vid = item.get("vesselVisitId", "")
+            if vid not in target_set:
+                continue
+
+            eta = self._parse_dt(item.get("eta"))
+            etd = self._parse_dt(item.get("etd"))
+
+            vessel_info = item.get("vesselInfo") or {}
+            vessel_id_str = vessel_info.get("id") or vid
+            vessel_name = vessel_info.get("name") or ""
+
+            vessels[vid] = Vessel(
+                vessel_id=vessel_id_str,
+                vessel_name=vessel_name,
+                voyage_id=vid,
+                eta=eta or datetime.now(),
+                etd=etd or (datetime.now() + timedelta(hours=48)),
+                berth_id="",
+            )
+
+        missing = target_set - set(vessels.keys())
+        if missing:
+            logger.warning(f"TOSLoader: VesselVisit 中未找到艘次号: {missing}")
+        else:
+            logger.info(f"TOSLoader: 加载船舶 {len(vessels)} 艘 ({list(vessels.keys())})")
+        return vessels
+
+    def load_discharge_containers(
+        self,
+        visit_ids: List[str],
+        vessels: Dict[str, Vessel],
+    ) -> List[Container]:
+        """
+        从 BoundList JSON 的 Inbound 列表中提取目标艘次的卸船箱（进口箱）。
+
+        过滤条件:
+          visitId in visit_ids  AND  boundType == 2  AND  visitType == 1
+
+        Parameters
+        ----------
+        visit_ids : 目标艘次号列表
+        vessels   : load_vessels() 的返回值，用于补充 eta/etd/vessel_id
+
+        Returns
+        -------
+        List[Container]  (business_type 固定为 IMPORT)
+        """
+        with open(self.bound_list_path, "r", encoding="utf-8") as f:
+            raw: dict = json.load(f)
+
+        inbound: List[dict] = raw.get("Inbound", [])
+        target_set = set(visit_ids)
+        containers: List[Container] = []
+
+        for item in inbound:
+            dto = item.get("boundListDTO") or {}
+            visit_id = dto.get("visitId") or ""
+
+            if visit_id not in target_set:
+                continue
+            if dto.get("boundType") != 1:
+                continue
+            if dto.get("visitType") != 1:
+                continue
+
+            c_raw = item.get("container")
+            if not c_raw:
+                continue
+
+            vessel = vessels.get(visit_id)
+
+            containers.append(Container(
+                container_id=c_raw.get("containerId") or dto.get("contrId", ""),
+                size=self._parse_size(c_raw.get("containerSize", 1)),
+                container_type=self._parse_container_type(
+                    c_raw.get("containerISO", ""),
+                    c_raw.get("powerRequired", 0),
+                ),
+                weight_class=self._parse_weight_class(
+                    c_raw.get("weight"),
+                    c_raw.get("freightKind"),
+                ),
+                business_type=BusinessType.IMPORT,
+                voyage_id=visit_id,
+                vessel_id=vessel.vessel_id if vessel else visit_id,
+                eta=vessel.eta if vessel else datetime.now(),
+                etd=vessel.etd if vessel else None,
+            ))
+
+        logger.info(
+            f"TOSLoader: 加载卸船箱 {len(containers)} 个"
+            f" (艘次: {visit_ids})"
+        )
+        return containers
+
+    def build_planning_horizon(
+        self, vessels: Dict[str, Vessel]
+    ) -> Tuple[datetime, datetime]:
+        """
+        从多艘船信息推断规划时间窗口。
+
+        Returns
+        -------
+        (horizon_start, horizon_end)
+          horizon_start = 所有船中最早的 ETA
+          horizon_end   = 所有船中最晚的 ETD
+        """
+        all_v = list(vessels.values())
+        if not all_v:
+            now = datetime.now()
+            return now, now + timedelta(hours=48)
+        horizon_start = min(v.eta for v in all_v)
+        horizon_end = max(v.etd for v in all_v)
+        if horizon_end <= horizon_start:
+            horizon_end = horizon_start + timedelta(hours=48)
+        logger.info(
+            f"TOSLoader: 规划时间窗口 {horizon_start} → {horizon_end}"
+        )
+        return horizon_start, horizon_end
+
+    # --------------------------------------------------------------- helpers
+
+    @staticmethod
+    def _parse_dt(dt_str: Optional[str]) -> Optional[datetime]:
+        """解析 TOS 时间字符串，兼容含时区后缀的格式。"""
+        if not dt_str:
+            return None
+        # 去掉时区部分 (+00:00 / Z)
+        cleaned = dt_str.split("+")[0].split("Z")[0].strip()
+        for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                return datetime.strptime(cleaned, fmt)
+            except ValueError:
+                continue
+        logger.warning(f"TOSLoader: 无法解析时间字符串: {dt_str!r}")
+        return None
+
+    @classmethod
+    def _parse_size(cls, size_int: int) -> ContainerSize:
+        return cls._SIZE_MAP.get(size_int, ContainerSize.SIZE_20)
+
+    @classmethod
+    def _parse_container_type(cls, iso_code: str, power_required: int) -> ContainerType:
+        """
+        containerISO 后缀优先; powerRequired=1 强制识别为冷藏箱。
+        """
+        if power_required:
+            return ContainerType.REEFER
+        code = (iso_code or "").upper()
+        for suffix, ctype in cls._ISO_TYPE_MAP.items():
+            if suffix in code:
+                return ctype
+        return ContainerType.DRY
+
+    @classmethod
+    def _parse_weight_class(
+        cls,
+        weight: Optional[float],
+        freight_kind: Optional[int],
+    ) -> WeightClass:
+        """
+        freightKind=3 → 空箱 (EMPTY)
+        weight > HEAVY_WEIGHT_THRESHOLD → 重箱 (HEAVY)
+        其余 → 轻箱 (LIGHT)
+        """
+        if freight_kind == 3:
+            return WeightClass.EMPTY
+        if weight is None or weight <= 0:
+            return WeightClass.EMPTY
+        if weight > cls.HEAVY_WEIGHT_THRESHOLD:
+            return WeightClass.HEAVY
+        return WeightClass.LIGHT
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Section M: Main Runner
 # ═══════════════════════════════════════════════════════════════
 
-def create_sample_data() -> Tuple[List[Container], List[YardArea]]:
-    """Realistic sample data for a small terminal yard planning scenario."""
-    now = datetime(2026, 4, 16, 8, 0)
 
-    # Sample containers
-    containers = [
-        # Import group
-        Container(
-            container_id="CN001", size=ContainerSize.SIZE_40, container_type=ContainerType.DRY,
-            weight_class=WeightClass.HEAVY, business_type=BusinessType.IMPORT,
-            voyage_id="VOY-001", vessel_id="VES-001", eta=now,
-            consignee="ABC Logistics", latest_pickup=now + timedelta(hours=48),
-        ),
-        Container(
-            container_id="CN002", size=ContainerSize.SIZE_20, container_type=ContainerType.DRY,
-            weight_class=WeightClass.LIGHT, business_type=BusinessType.IMPORT,
-            voyage_id="VOY-001", vessel_id="VES-001", eta=now,
-            consignee="ABC Logistics",
-        ),
-        # Export group
-        Container(
-            container_id="CN003", size=ContainerSize.SIZE_45, container_type=ContainerType.DRY,
-            weight_class=WeightClass.EMPTY, business_type=BusinessType.EXPORT,
-            voyage_id="VOY-002", vessel_id="VES-002", eta=now + timedelta(hours=12),
-            destination_port="SGP", receiving_start=now + timedelta(hours=6),
-        ),
-        Container(
-            container_id="CN004", size=ContainerSize.SIZE_40, container_type=ContainerType.DRY,
-            weight_class=WeightClass.HEAVY, business_type=BusinessType.EXPORT,
-            voyage_id="VOY-002", vessel_id="VES-002", eta=now + timedelta(hours=12),
-            destination_port="SGP",
-        ),
-    ]
+def run_plan(visit_ids: List[str], apply_to_yard: bool = True) -> PlanningResult:
+    """
+    规划入口：传入一个或多个艘次号，完成卸船箱堆场分配规划。
 
-    # Sample yard areas (import and export separated)
-    import_area = YardArea(
-        area_id="IMP-A", business_type=BusinessType.IMPORT,
-        bays=[
-            Bay(bay_id="IMP-A-01", bay_number=1, yard_area_id="IMP-A", total_columns=50),
-            Bay(bay_id="IMP-A-02", bay_number=2, yard_area_id="IMP-A", total_columns=50),
-        ],
-        large_bay_pairs=[
-            LargeBayPair(pair_id="IMP-A-L1", yard_area_id="IMP-A",
-                         bay_a=Bay(bay_id="IMP-A-01", bay_number=1, yard_area_id="IMP-A", total_columns=50),
-                         bay_b=Bay(bay_id="IMP-A-02", bay_number=2, yard_area_id="IMP-A", total_columns=50),
-                         is_edge_pair=True)
-        ]
+    Parameters
+    ----------
+    visit_ids    : 目标艘次号列表，如 ["test0113"] 或 ["MAGNA25013", "MAGNA25014"]
+    apply_to_yard: True → 将规划结果写回 YardSpace，实时占用对应槽位
+
+    Returns
+    -------
+    PlanningResult
+      result.metrics["slot_assignments"] = {container_id -> fullSlotName}
+    """
+    print("=" * 70)
+    print(f"  堆场规划  艘次: {visit_ids}")
+    print("=" * 70)
+
+    # ── 步骤 1: 从 TOS JSON 加载船舶信息 ────────────────────────────────────
+    loader = TOSLoader()
+    vessels = loader.load_vessels(visit_ids)
+    horizon_start, horizon_end = loader.build_planning_horizon(vessels)
+
+    # ── 步骤 2: 提取卸船箱（进口箱, boundType=1, visitType=1） ──────────────
+    containers = loader.load_discharge_containers(visit_ids, vessels)
+
+    if not containers:
+        logger.warning("未加载到任何卸船箱，规划终止")
+        return PlanningResult(
+            run_id=f"PLAN-EMPTY",
+            timestamp=datetime.now(),
+            mode=PlannerMode.FULL_PLAN,
+        )
+
+    # ── 步骤 3: 加载堆场实时状态 ─────────────────────────────────────────────
+    from useable_space import YardSpace
+    yard = YardSpace.load()
+    yard.print_summary()
+
+    # ── 步骤 4: 配置箱区进/出口属性（奇数编号=进口，偶数=出口） ─────────────
+    block_ids = sorted({k[0] for k in yard.stacks.keys()})
+
+    def _serial(block_id: str) -> int:
+        digits = "".join(c for c in block_id if c.isdigit())
+        return int(digits) if digits else 0
+
+    block_business_types = {
+        bid: (BusinessType.IMPORT if _serial(bid) % 2 == 1 else BusinessType.EXPORT)
+        for bid in block_ids
+    }
+
+    # ── 步骤 5: 执行两阶段规划 ──────────────────────────────────────────────
+    planner = YardPlanner()
+    result = planner.plan_with_yard_space(
+        yard=yard,
+        containers=containers,
+        block_business_types=block_business_types,
+        mode=PlannerMode.FULL_PLAN,
+        apply_to_yard=apply_to_yard,
+        horizon_start=horizon_start,
+        horizon_end=horizon_end,
     )
 
-    export_area = YardArea(
-        area_id="EXP-B", business_type=BusinessType.EXPORT,
-        bays=[
-            Bay(bay_id="EXP-B-01", bay_number=1, yard_area_id="EXP-B", total_columns=60),
-            Bay(bay_id="EXP-B-02", bay_number=2, yard_area_id="EXP-B", total_columns=60),
-            Bay(bay_id="EXP-B-03", bay_number=3, yard_area_id="EXP-B", total_columns=60),
-        ],
-        large_bay_pairs=[
-            LargeBayPair(pair_id="EXP-B-L1", yard_area_id="EXP-B",
-                         bay_a=Bay(bay_id="EXP-B-01", bay_number=1, yard_area_id="EXP-B", total_columns=60),
-                         bay_b=Bay(bay_id="EXP-B-02", bay_number=2, yard_area_id="EXP-B", total_columns=60),
-                         is_edge_pair=True),
-            LargeBayPair(pair_id="EXP-B-L2", yard_area_id="EXP-B",
-                         bay_a=Bay(bay_id="EXP-B-02", bay_number=2, yard_area_id="EXP-B", total_columns=60),
-                         bay_b=Bay(bay_id="EXP-B-03", bay_number=3, yard_area_id="EXP-B", total_columns=60),
-                         is_edge_pair=False)
-        ]
-    )
+    # ── 步骤 6: 打印槽位分配结果 ────────────────────────────────────────────
+    assignments = result.metrics.get("slot_assignments", {})
+    if assignments:
+        print(f"\n  槽位分配结果 ({len(assignments)} 个箱):")
+        for cid, slot in list(assignments.items())[:20]:
+            print(f"    {cid}  →  {slot}")
+        if len(assignments) > 20:
+            print(f"    ... 共 {len(assignments)} 个")
+    else:
+        print("\n  无槽位分配结果")
 
-    return containers, [import_area, export_area]
+    return result
 
 
 if __name__ == "__main__":
-    print("🚀 Starting Container Terminal Yard Allocation Framework Demo")
-    containers, yard_areas = create_sample_data()
-
-    planner = YardPlanner()
-
-    # Run full plan (Function 1 + Function 2)
-    result = planner.plan(
-        containers=containers,
-        yard_areas=yard_areas,
-        mode=PlannerMode.FULL_PLAN,
-    )
-
-    print("\n✅ Framework ready for extension.")
-    print("   - Import/export separation enforced")
-    # - Rolling window infrastructure in place
-    # - Two-stage heuristic with replaceable scoring & objectives
-    # - Split logic and 45ft edge constraint implemented
-    # - Column-level planning with large-bay support
+    # 传入目标艘次号（可多个），按需修改
+    run_plan(visit_ids=["CHANGQING1229"])
