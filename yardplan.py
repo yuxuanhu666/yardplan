@@ -127,8 +127,9 @@ class Container:
     weight_class: WeightClass
     business_type: BusinessType
 
-    # Vessel linkage
+    # Visit and line linkage
     voyage_id: str
+    line_key: Optional[int]
     vessel_id: str
 
     # Timing (deterministic for vessel operations, uncertain for truck)
@@ -153,6 +154,28 @@ class Container:
     current_bay: Optional[int] = None
     current_row: Optional[str] = None
     current_tier: Optional[int] = None
+
+    # Raw TOS attributes used to build the range-level response filter.
+    iso_type: Optional[str] = None
+    category: Optional[int] = None
+    pod: Optional[str] = None
+    cattier_kind: Optional[str] = None
+    trade_code: Optional[str] = None
+    freight_kind: Optional[int] = None
+    owner_company: Optional[str] = None
+    line_company: Optional[str] = None
+    truck_company: Optional[str] = None
+    belonger_company: Optional[str] = None
+    work_type: Optional[int] = None
+    bol: Optional[str] = None
+    damage_code: Optional[str] = None
+    raw_weight: Optional[float] = None
+    is_reefer: bool = False
+    is_hazardous: bool = False
+    is_damage: bool = False
+    is_high: bool = False
+    is_gauge: bool = False
+    is_dirty: bool = False
 
     def is_large_container(self) -> bool:
         """Returns True if container requires a large bay (2 adjacent bays)."""
@@ -352,6 +375,7 @@ class AllocationGroup:
     container_type: ContainerType
     weight_class: WeightClass
     voyage_id: str
+    line_key: Optional[int]
 
     # Grouping attributes (varies by business type)
     group_attributes: Dict[str, Any] = field(default_factory=dict)
@@ -524,7 +548,7 @@ GroupKeyFunc = Callable[[Container], Tuple]
 
 # Default grouping key functions (configurable, not hardcoded)
 DEFAULT_EXPORT_GROUP_KEYS: List[str] = [
-    "voyage_id",
+    "line_key",
     "size",
     "container_type",
     "weight_class",
@@ -532,7 +556,7 @@ DEFAULT_EXPORT_GROUP_KEYS: List[str] = [
 ]
 
 DEFAULT_IMPORT_GROUP_KEYS: List[str] = [
-    "voyage_id",
+    "line_key",
     "size",
     "container_type",
     "weight_class",
@@ -670,6 +694,7 @@ class GroupingEngine:
             container_type=representative.container_type,
             weight_class=representative.weight_class,
             voyage_id=representative.voyage_id,
+            line_key=representative.line_key,
             group_attributes=attributes,
             containers=members,
             container_count=len(members),
@@ -740,6 +765,7 @@ class GroupingEngine:
                 container_type=group.container_type,
                 weight_class=group.weight_class,
                 voyage_id=group.voyage_id,
+                line_key=group.line_key,
                 group_attributes=group.group_attributes.copy(),
                 containers=sub_containers,
                 container_count=len(sub_containers),
@@ -1366,6 +1392,145 @@ class ResultFormatter:
     """Pretty printer for planning results."""
 
     @staticmethod
+    def build_range_plan(result: PlanningResult) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Convert group-level bay/column allocations to the API range format.
+
+        The output intentionally stops at block/bay/stack/tier ranges. It does
+        not assign individual containers to concrete slots.
+        """
+        group_by_id: Dict[str, AllocationGroup] = {
+            g.group_id: g for g in result.allocation_groups
+        }
+        data: List[Dict[str, Any]] = []
+
+        for idx, alloc in enumerate(result.bay_column_allocations, start=1):
+            group = group_by_id.get(alloc.group_id)
+            if group is None:
+                continue
+
+            range_list = [
+                ResultFormatter._build_range_item(alloc.yard_area_id, bay_spec, columns_used)
+                for bay_spec, columns_used in alloc.bay_column_details
+            ]
+            if not range_list:
+                continue
+
+            data.append({
+                "groupKey": idx,
+                "groupId": idx,
+                "rangeList": range_list,
+                "filter": ResultFormatter._build_filter(group),
+            })
+
+        return {"data": data}
+
+    @staticmethod
+    def _build_range_item(
+        block_id: str,
+        bay_spec: Any,
+        columns_used: int,
+    ) -> Dict[str, Any]:
+        if isinstance(bay_spec, tuple):
+            start_bay = min(int(bay_spec[0]), int(bay_spec[1]))
+            end_bay = max(int(bay_spec[0]), int(bay_spec[1]))
+        else:
+            start_bay = end_bay = int(bay_spec)
+
+        return {
+            "blockId": block_id,
+            "startBayIndex": start_bay,
+            "endBayIndex": end_bay,
+            "startStackIndex": 1,
+            "endStackIndex": max(1, int(columns_used)),
+            "startTierIndex": 1,
+            "endTierIndex": MAX_TIERS_PER_COLUMN,
+        }
+
+    @staticmethod
+    def _build_filter(group: AllocationGroup) -> Dict[str, Any]:
+        external_filter = group.group_attributes.get("filter")
+        if isinstance(external_filter, dict):
+            return external_filter
+
+        containers = group.containers
+
+        def unique(attr: str) -> List[Any]:
+            values = []
+            for container in containers:
+                value = getattr(container, attr, None)
+                if value is None or value == "":
+                    continue
+                candidates = value if isinstance(value, list) else [value]
+                for candidate in candidates:
+                    if candidate is None or candidate == "":
+                        continue
+                    if candidate not in values:
+                        values.append(candidate)
+            return values
+
+        weights = [
+            ResultFormatter._normalise_weight(c.raw_weight)
+            for c in containers
+            if c.raw_weight is not None
+        ]
+
+        weight_class = {
+            WeightClass.EMPTY: 0,
+            WeightClass.LIGHT: 1,
+            WeightClass.HEAVY: 2,
+        }.get(group.weight_class)
+
+        return {
+            "filterName": ResultFormatter._filter_name(group),
+            "isoType": unique("iso_type"),
+            "category": unique("category"),
+            "pod": unique("pod"),
+            "cattierKind": unique("cattier_kind"),
+            "tradeCode": unique("trade_code"),
+            "freightKind": unique("freight_kind"),
+            "bReefer": any(c.is_reefer for c in containers),
+            "bHazardous": any(c.is_hazardous for c in containers),
+            "bDamage": any(c.is_damage for c in containers),
+            "bHigh": any(c.is_high for c in containers),
+            "bGauge": any(c.is_gauge for c in containers),
+            "ownerCompany": unique("owner_company"),
+            "lineCompany": unique("line_company"),
+            "truckCompany": unique("truck_company"),
+            "belongerCompany": unique("belonger_company"),
+            "bDirty": any(c.is_dirty for c in containers),
+            "weightClass": weight_class,
+            "weightMin": min(weights) if weights else None,
+            "weightMax": max(weights) if weights else None,
+            "workType": ResultFormatter._single_or_none(unique("work_type")),
+            "bol": unique("bol"),
+            "damageCode": unique("damage_code"),
+        }
+
+    @staticmethod
+    def _filter_name(group: AllocationGroup) -> str:
+        business_name = "进口" if group.business_type == BusinessType.IMPORT else "出口"
+        weight_name = {
+            WeightClass.EMPTY: "空箱",
+            WeightClass.LIGHT: "轻箱",
+            WeightClass.HEAVY: "重箱",
+        }.get(group.weight_class, "箱")
+        return f"{business_name}{weight_name}过滤"
+
+    @staticmethod
+    def _normalise_weight(weight: Optional[float]) -> Optional[float]:
+        if weight is None:
+            return None
+        value = float(weight)
+        if abs(value) > 1000:
+            value = value / 1000.0
+        return round(value, 3)
+
+    @staticmethod
+    def _single_or_none(values: List[Any]) -> Optional[Any]:
+        return values[0] if values else None
+
+    @staticmethod
     def print_summary(result: PlanningResult):
         print("\n" + "="*80)
         print("YARD SPACE ALLOCATION PLANNING RESULT")
@@ -1380,11 +1545,6 @@ class ResultFormatter:
             print("\n⚠️  Warnings:")
             for w in result.warnings:
                 print(f"   - {w}")
-
-        print("\nSample Bay Allocations (first 3):")
-        for alloc in result.bay_column_allocations[:3]:
-            print(f"  Group {alloc.group_id} → Area {alloc.yard_area_id} | "
-                  f"Details: {alloc.bay_column_details} | Notes: {alloc.notes}")
 
         print("\n" + "="*80)
 
@@ -1422,6 +1582,8 @@ class YardPlanner:
         if mode == PlannerMode.GROUP_ONLY:
             groups = self.grouping_engine.group_containers(containers)
             result = PlanningResult(run_id=run_id, timestamp=timestamp, mode=mode, allocation_groups=groups)
+            result.metrics["range_plan"] = {"data": []}
+            result.metrics["data"] = []
             self.formatter.print_summary(result)
             return result
 
@@ -1453,9 +1615,103 @@ class YardPlanner:
             bay_column_allocations=bay_allocations,
             unassigned_groups=unassigned,
         )
+        range_plan = self.formatter.build_range_plan(result)
+        result.metrics["range_plan"] = range_plan
+        result.metrics["data"] = range_plan["data"]
 
         self.formatter.print_summary(result)
         return result
+
+    def plan_groups(
+        self,
+        groups: List[AllocationGroup],
+        yard_areas: List[YardArea],
+        mode: PlannerMode = PlannerMode.FULL_PLAN,
+        horizon_start: Optional[datetime] = None,
+        horizon_end: Optional[datetime] = None,
+    ) -> PlanningResult:
+        """
+        Plan pre-built allocation groups without regrouping containers.
+
+        This is used by input type=2, where allocation groups come from an
+        external interface and should go directly into the two-stage algorithm.
+        """
+        run_id = f"PLAN-{uuid.uuid4().hex[:12].upper()}"
+        timestamp = datetime.now()
+
+        self._ensure_group_demands(groups)
+
+        if not horizon_start or not horizon_end:
+            all_times: List[datetime] = []
+            for group in groups:
+                if group.earliest_arrival:
+                    all_times.append(group.earliest_arrival)
+                if group.latest_departure:
+                    all_times.append(group.latest_departure)
+            horizon_start = min(all_times) if all_times else datetime.now()
+            horizon_end = max(all_times) if all_times else horizon_start + timedelta(hours=48)
+
+        time_steps = self.rolling_planner.generate_time_steps(horizon_start, horizon_end)
+        windows = self.rolling_planner.generate_rolling_windows(time_steps)
+        self.rolling_planner.update_future_capacity(windows, yard_areas, [])
+
+        area_assignments, bay_allocations, unassigned = self.allocation_engine.allocate(groups, yard_areas)
+        result = PlanningResult(
+            run_id=run_id,
+            timestamp=timestamp,
+            mode=mode,
+            allocation_groups=groups,
+            area_assignments=area_assignments,
+            bay_column_allocations=bay_allocations,
+            unassigned_groups=unassigned,
+        )
+        range_plan = self.formatter.build_range_plan(result)
+        result.metrics["range_plan"] = range_plan
+        result.metrics["data"] = range_plan["data"]
+
+        self.formatter.print_summary(result)
+        return result
+
+    def plan_groups_with_yard_space(
+        self,
+        yard: Any,
+        groups: List[AllocationGroup],
+        block_business_types: Dict[str, BusinessType],
+        block_ids: Optional[List[str]] = None,
+        mode: PlannerMode = PlannerMode.FULL_PLAN,
+        apply_to_yard: bool = False,
+        horizon_start: Optional[datetime] = None,
+        horizon_end: Optional[datetime] = None,
+    ) -> PlanningResult:
+        yard_areas, _slot_registry = YardSpaceAdapter.build_yard_areas(
+            yard, block_business_types, block_ids
+        )
+        result = self.plan_groups(
+            groups=groups,
+            yard_areas=yard_areas,
+            mode=mode,
+            horizon_start=horizon_start,
+            horizon_end=horizon_end,
+        )
+        if apply_to_yard:
+            assignments = YardSpaceAdapter.apply_allocation(result, yard)
+            result.metrics["slot_assignments"] = assignments
+            logger.info(
+                f"已将规划结果写回 YardSpace: {len(assignments)} 个容器获得槽位"
+            )
+        return result
+
+    def _ensure_group_demands(self, groups: List[AllocationGroup]) -> None:
+        for group in groups:
+            if group.column_demand > 0:
+                continue
+            if group.containers:
+                self.grouping_engine.demand_converter.convert_group(group)
+                continue
+            raise ValueError(
+                f"外部分配组 {group.group_id} 缺少 column_demand，"
+                "且没有 containers 可用于推算列需求"
+            )
 
     def plan_with_yard_space(
         self,
@@ -1482,15 +1738,14 @@ class YardPlanner:
                                (YardSpace 中不含此信息, 须由外部配置提供)
         block_ids            : 仅使用指定 block 参与规划, None 表示全部
         mode                 : PlannerMode (GROUP_ONLY / ALLOCATE_ONLY / FULL_PLAN)
-        apply_to_yard        : True → 规划完成后调用 YardSpace.place_container()
-                               将分配结果写回实际状态, 槽位映射存入 result.metrics
+        apply_to_yard        : True → 兼容旧流程, 规划完成后额外写回具体槽位
         horizon_start/end    : 规划时间窗口 (可选, 不提供则自动从 containers 推断)
 
         Returns
         -------
         PlanningResult
-            result.metrics["slot_assignments"] 在 apply_to_yard=True 时包含
-            {container_id -> fullSlotName} 映射
+            result.metrics["range_plan"] 包含 {"data": [...]} 范围级分配结果。
+            apply_to_yard=True 时额外包含 result.metrics["slot_assignments"]。
         """
         yard_areas, _slot_registry = YardSpaceAdapter.build_yard_areas(
             yard, block_business_types, block_ids
@@ -1526,9 +1781,9 @@ class TOSLoader:
 
     卸船箱（进口箱）过滤条件（取自 Inbound 列表）
     ----------------------------------------
-    - visitId   in visit_ids   : 匹配目标艘次号
-    - boundType == 2           : 进入堆场方向
-    - visitType == 1           : 来自船舶（非进闸）
+    - serviceLineKey in line_keys : 匹配目标航线
+    - boundType == 1              : 进入堆场方向
+    - visitType == 1              : 来自船舶（非进闸）
     """
 
     # containerISO 后缀 → ContainerType
@@ -1564,13 +1819,13 @@ class TOSLoader:
 
     # ------------------------------------------------------------------ load
 
-    def load_vessels(self, visit_ids: List[str]) -> Dict[str, Vessel]:
+    def load_vessels(self, line_keys: List[int]) -> Dict[str, Vessel]:
         """
-        从 VesselVisit JSON 加载目标艘次号对应的船舶信息。
+        从 VesselVisit JSON 加载目标 lineKey 对应的船舶信息。
 
         Parameters
         ----------
-        visit_ids : 目标艘次号列表 (对应 vesselVisitId 字段)
+        line_keys : 目标航线号列表 (对应 lineKey 字段，int)
 
         Returns
         -------
@@ -1579,13 +1834,19 @@ class TOSLoader:
         with open(self.vessel_visit_path, "r", encoding="utf-8") as f:
             raw: List[dict] = json.load(f)
 
-        target_set = set(visit_ids)
+        target_set = {
+            lk for lk in (self._coerce_line_key(value) for value in line_keys)
+            if lk is not None
+        }
         vessels: Dict[str, Vessel] = {}
+        matched_line_keys: Set[int] = set()
 
         for item in raw:
             vid = item.get("vesselVisitId", "")
-            if vid not in target_set:
+            line_key = self._coerce_line_key(item.get("lineKey"))
+            if line_key not in target_set:
                 continue
+            matched_line_keys.add(line_key)
 
             eta = self._parse_dt(item.get("eta"))
             etd = self._parse_dt(item.get("etd"))
@@ -1603,27 +1864,30 @@ class TOSLoader:
                 berth_id="",
             )
 
-        missing = target_set - set(vessels.keys())
+        missing = target_set - matched_line_keys
         if missing:
-            logger.warning(f"TOSLoader: VesselVisit 中未找到艘次号: {missing}")
+            logger.warning(f"TOSLoader: VesselVisit 中未找到航线号: {sorted(missing)}")
         else:
-            logger.info(f"TOSLoader: 加载船舶 {len(vessels)} 艘 ({list(vessels.keys())})")
+            logger.info(
+                f"TOSLoader: 加载船舶 {len(vessels)} 艘"
+                f" (lineKeys: {sorted(target_set)})"
+            )
         return vessels
 
     def load_discharge_containers(
         self,
-        visit_ids: List[str],
+        line_keys: List[int],
         vessels: Dict[str, Vessel],
     ) -> List[Container]:
         """
-        从 BoundList JSON 的 Inbound 列表中提取目标艘次的卸船箱（进口箱）。
+        从 BoundList JSON 的 Inbound 列表中提取目标航线的卸船箱（进口箱）。
 
         过滤条件:
-          visitId in visit_ids  AND  boundType == 2  AND  visitType == 1
+          serviceLineKey in line_keys  AND  boundType == 1  AND  visitType == 1
 
         Parameters
         ----------
-        visit_ids : 目标艘次号列表
+        line_keys : 目标航线号列表（对应 container.serviceLineKey，int）
         vessels   : load_vessels() 的返回值，用于补充 eta/etd/vessel_id
 
         Returns
@@ -1634,31 +1898,43 @@ class TOSLoader:
             raw: dict = json.load(f)
 
         inbound: List[dict] = raw.get("Inbound", [])
-        target_set = set(visit_ids)
+        target_set = {
+            lk for lk in (self._coerce_line_key(value) for value in line_keys)
+            if lk is not None
+        }
         containers: List[Container] = []
 
         for item in inbound:
+            c_raw = item.get("container")
+            if not c_raw:
+                continue
+
+            service_line_key = self._coerce_line_key(c_raw.get("serviceLineKey"))
+            if service_line_key not in target_set:
+                continue
+
             dto = item.get("boundListDTO") or {}
             visit_id = dto.get("visitId") or ""
-
-            if visit_id not in target_set:
-                continue
             if dto.get("boundType") != 1:
                 continue
             if dto.get("visitType") != 1:
                 continue
 
-            c_raw = item.get("container")
-            if not c_raw:
-                continue
-
             vessel = vessels.get(visit_id)
+            iso_type = c_raw.get("containerISO") or ""
+            is_gauge = any(self._coerce_bool(c_raw.get(key)) for key in (
+                "oog",
+                "overLongBack",
+                "overLongFront",
+                "overWidthLeft",
+                "overWidthRight",
+            ))
 
             containers.append(Container(
                 container_id=c_raw.get("containerId") or dto.get("contrId", ""),
                 size=self._parse_size(c_raw.get("containerSize", 1)),
                 container_type=self._parse_container_type(
-                    c_raw.get("containerISO", ""),
+                    iso_type,
                     c_raw.get("powerRequired", 0),
                 ),
                 weight_class=self._parse_weight_class(
@@ -1667,16 +1943,69 @@ class TOSLoader:
                 ),
                 business_type=BusinessType.IMPORT,
                 voyage_id=visit_id,
+                line_key=service_line_key,
                 vessel_id=vessel.vessel_id if vessel else visit_id,
                 eta=vessel.eta if vessel else datetime.now(),
                 etd=vessel.etd if vessel else None,
+                iso_type=iso_type,
+                category=c_raw.get("category"),
+                pod=c_raw.get("pod"),
+                cattier_kind=c_raw.get("cattierKind"),
+                trade_code=c_raw.get("tradeCode"),
+                freight_kind=c_raw.get("freightKind"),
+                owner_company=c_raw.get("ownerCompany"),
+                line_company=c_raw.get("lineCompany"),
+                truck_company=c_raw.get("truckCompany"),
+                belonger_company=c_raw.get("gradesCompany"),
+                work_type=c_raw.get("workType"),
+                bol=c_raw.get("bol"),
+                damage_code=c_raw.get("damageType"),
+                raw_weight=c_raw.get("weight"),
+                is_reefer=self._coerce_bool(c_raw.get("powerRequired")) or "RF" in iso_type.upper(),
+                is_hazardous=self._coerce_bool(c_raw.get("bHazardous")),
+                is_damage=self._coerce_bool(c_raw.get("damage")) or bool(c_raw.get("damageType")),
+                is_high=self._coerce_bool(c_raw.get("overHeight")),
+                is_gauge=is_gauge,
+                is_dirty=self._coerce_bool(c_raw.get("dirty")),
             ))
 
         logger.info(
             f"TOSLoader: 加载卸船箱 {len(containers)} 个"
-            f" (艘次: {visit_ids})"
+            f" (lineKeys: {sorted(target_set)})"
         )
         return containers
+
+    def load_external_allocation_groups(
+        self,
+        line_keys: List[int],
+        vessels: Dict[str, Vessel],
+    ) -> List[AllocationGroup]:
+        """
+        预留 type=2 的外部分配组读取入口。
+
+        后续接口接入后，在这里把接口返回值转换成 AllocationGroup 列表。
+        每个外部分配组至少需要提供:
+          - group_id
+          - business_type
+          - size
+          - container_type
+          - weight_class
+          - line_key
+          - column_demand
+
+        如果接口已经返回 filter，可放到:
+          group.group_attributes["filter"]
+
+        这样后续两阶段算法和最终 range_plan 格式都不用再改。
+        """
+        normalized_line_keys = [
+            lk for lk in (self._coerce_line_key(value) for value in line_keys)
+            if lk is not None
+        ]
+        raise NotImplementedError(
+            "type=2 需要从外部分配组接口读取数据；接口未提供，"
+            f"已预留 load_external_allocation_groups(line_keys={normalized_line_keys})"
+        )
 
     def build_planning_horizon(
         self, vessels: Dict[str, Vessel]
@@ -1720,6 +2049,36 @@ class TOSLoader:
         logger.warning(f"TOSLoader: 无法解析时间字符串: {dt_str!r}")
         return None
 
+    @staticmethod
+    def _coerce_line_key(raw_value: Any) -> Optional[int]:
+        """将 lineKey/serviceLineKey 统一解析为 int。"""
+        if raw_value is None:
+            return None
+        if isinstance(raw_value, bool):
+            return None
+        if isinstance(raw_value, int):
+            return raw_value
+        if isinstance(raw_value, float):
+            return int(raw_value) if raw_value.is_integer() else None
+
+        text = str(raw_value).strip()
+        if not text:
+            return None
+        try:
+            return int(text)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _coerce_bool(raw_value: Any) -> bool:
+        if isinstance(raw_value, bool):
+            return raw_value
+        if raw_value is None:
+            return False
+        if isinstance(raw_value, (int, float)):
+            return raw_value != 0
+        return str(raw_value).strip().lower() in {"1", "true", "yes", "y"}
+
     @classmethod
     def _parse_size(cls, size_int: int) -> ContainerSize:
         return cls._SIZE_MAP.get(size_int, ContainerSize.SIZE_20)
@@ -1762,39 +2121,71 @@ class TOSLoader:
 # ═══════════════════════════════════════════════════════════════
 
 
-def run_plan(visit_ids: List[str], apply_to_yard: bool = True) -> PlanningResult:
+def run_plan(
+    line_keys: List[int],
+    type: int = 1,
+    apply_to_yard: bool = False,
+) -> PlanningResult:
     """
-    规划入口：传入一个或多个艘次号，完成卸船箱堆场分配规划。
+    规划入口：传入一个或多个航线号，完成卸船箱堆场分配规划。
 
     Parameters
     ----------
-    visit_ids    : 目标艘次号列表，如 ["test0113"] 或 ["MAGNA25013", "MAGNA25014"]
+    line_keys    : 目标航线号列表，如 [469144, 471924]
+    type         : 1 → 读取航线箱子并自动划分分配组
+                   2 → 从外部分配组接口读取分配组，直接进入两阶段算法
     apply_to_yard: True → 将规划结果写回 YardSpace，实时占用对应槽位
 
     Returns
     -------
     PlanningResult
-      result.metrics["slot_assignments"] = {container_id -> fullSlotName}
+      result.metrics["range_plan"] = {"data": [...]}，其中每项为分配组范围。
     """
+    if type not in (1, 2):
+        raise ValueError(f"type 只能为 1 或 2，当前为: {type!r}")
+
+    loader = TOSLoader()
+    normalized_line_keys: List[int] = []
+    for raw_key in line_keys:
+        line_key = loader._coerce_line_key(raw_key)
+        if line_key is None:
+            raise ValueError(f"无效的 lineKey: {raw_key!r}")
+        normalized_line_keys.append(line_key)
+
     print("=" * 70)
-    print(f"  堆场规划  艘次: {visit_ids}")
+    print(f"  堆场规划  type={type}  lineKeys: {normalized_line_keys}")
     print("=" * 70)
 
     # ── 步骤 1: 从 TOS JSON 加载船舶信息 ────────────────────────────────────
-    loader = TOSLoader()
-    vessels = loader.load_vessels(visit_ids)
+    vessels = loader.load_vessels(normalized_line_keys)
     horizon_start, horizon_end = loader.build_planning_horizon(vessels)
 
-    # ── 步骤 2: 提取卸船箱（进口箱, boundType=1, visitType=1） ──────────────
-    containers = loader.load_discharge_containers(visit_ids, vessels)
+    containers: List[Container] = []
+    external_groups: List[AllocationGroup] = []
 
-    if not containers:
-        logger.warning("未加载到任何卸船箱，规划终止")
-        return PlanningResult(
-            run_id=f"PLAN-EMPTY",
-            timestamp=datetime.now(),
-            mode=PlannerMode.FULL_PLAN,
+    if type == 1:
+        # ── 步骤 2A: 提取卸船箱，再由算法自动划分分配组 ─────────────────────
+        containers = loader.load_discharge_containers(normalized_line_keys, vessels)
+        if not containers:
+            logger.warning("未加载到任何卸船箱，规划终止")
+            return PlanningResult(
+                run_id=f"PLAN-EMPTY",
+                timestamp=datetime.now(),
+                mode=PlannerMode.FULL_PLAN,
+            )
+    else:
+        # ── 步骤 2B: 从外部分配组接口读取分配组（接口暂未接入） ─────────────
+        external_groups = loader.load_external_allocation_groups(
+            normalized_line_keys,
+            vessels,
         )
+        if not external_groups:
+            logger.warning("未加载到任何外部分配组，规划终止")
+            return PlanningResult(
+                run_id=f"PLAN-EMPTY",
+                timestamp=datetime.now(),
+                mode=PlannerMode.FULL_PLAN,
+            )
 
     # ── 步骤 3: 加载堆场实时状态 ─────────────────────────────────────────────
     from useable_space import YardSpace
@@ -1815,30 +2206,44 @@ def run_plan(visit_ids: List[str], apply_to_yard: bool = True) -> PlanningResult
 
     # ── 步骤 5: 执行两阶段规划 ──────────────────────────────────────────────
     planner = YardPlanner()
-    result = planner.plan_with_yard_space(
-        yard=yard,
-        containers=containers,
-        block_business_types=block_business_types,
-        mode=PlannerMode.FULL_PLAN,
-        apply_to_yard=apply_to_yard,
-        horizon_start=horizon_start,
-        horizon_end=horizon_end,
-    )
-
-    # ── 步骤 6: 打印槽位分配结果 ────────────────────────────────────────────
-    assignments = result.metrics.get("slot_assignments", {})
-    if assignments:
-        print(f"\n  槽位分配结果 ({len(assignments)} 个箱):")
-        for cid, slot in list(assignments.items())[:20]:
-            print(f"    {cid}  →  {slot}")
-        if len(assignments) > 20:
-            print(f"    ... 共 {len(assignments)} 个")
+    if type == 1:
+        result = planner.plan_with_yard_space(
+            yard=yard,
+            containers=containers,
+            block_business_types=block_business_types,
+            mode=PlannerMode.FULL_PLAN,
+            apply_to_yard=apply_to_yard,
+            horizon_start=horizon_start,
+            horizon_end=horizon_end,
+        )
     else:
-        print("\n  无槽位分配结果")
+        result = planner.plan_groups_with_yard_space(
+            yard=yard,
+            groups=external_groups,
+            block_business_types=block_business_types,
+            mode=PlannerMode.FULL_PLAN,
+            apply_to_yard=apply_to_yard,
+            horizon_start=horizon_start,
+            horizon_end=horizon_end,
+        )
+
+    # ── 步骤 6: 打印分配组范围结果 ─────────────────────────────────────────
+    range_items = result.metrics.get("range_plan", {}).get("data", [])
+    if range_items:
+        print(f"\n  分配组范围结果 ({len(range_items)} 个分配组):")
+        for item in range_items[:20]:
+            print(
+                f"    groupId={item['groupId']} groupKey={item['groupKey']} "
+                f"ranges={item['rangeList']} filter={item.get('filter', {})}"
+            )
+        if len(range_items) > 20:
+            print(f"    ... 共 {len(range_items)} 个分配组")
+    else:
+        print("\n  无分配组范围结果")
 
     return result
 
 
 if __name__ == "__main__":
-    # 传入目标艘次号（可多个），按需修改
-    run_plan(visit_ids=["CHANGQING1229"])
+    # 传入目标航线号（int，可多个），按需修改
+    run_plan(line_keys=[469144], type=1)
