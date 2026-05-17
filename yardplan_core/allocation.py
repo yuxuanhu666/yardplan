@@ -507,9 +507,19 @@ class Stage1LNSConfig:
     split_weight: float = 12.0
     large_group_split_discount: float = 0.45
     small_group_split_premium: float = 1.2
+    export_target_containers_per_area: int = 80
+    import_target_containers_per_area: int = 120
+    min_split_part_containers: int = 25
+    group_peak_weight: float = 100.0
+    fragment_weight: float = 12.0
+    base_split_weight: float = 6.0
+    workload_area_soft_target_export: float = 80.0
+    workload_area_soft_target_import: float = 120.0
+    workload_overload_weight: float = 18.0
+    workload_spread_weight_scale: float = 0.15
     physical_weight: float = 7.0
     unassigned_weight: float = 100000.0
-    line_max_area_share_threshold: float = 0.55
+    line_max_area_share_threshold: float = 0.40
     line_share_penalty_weight: float = 24.0
     line_share_penalty_power: float = 2.0
     line_min_total_for_share_penalty: int = 8
@@ -519,6 +529,7 @@ class Stage1LNSConfig:
     sa_min_temperature: float = 0.01
     repair_top_k: int = 5
     repair_random_tie_break: bool = True
+    repair_tie_tolerance: float = 1e-6
 
 
 @dataclass
@@ -870,7 +881,8 @@ class Stage1YardAreaAssigner:
         cost = (context.infeasible_count + len(solution.unassigned_group_ids)) * self.config.unassigned_weight
         cost += self._time_step_workload_cost(context, yard_areas)
         cost += self._line_concentration_cost(context.line_area_load)
-        cost += self._split_cost(solution, group_by_id)
+        cost += self._group_dispersion_cost(solution, group_by_id)
+        cost += self._split_operation_cost(solution, group_by_id)
         cost += context.physical_cost * self.config.physical_weight
         return cost
 
@@ -921,11 +933,16 @@ class Stage1YardAreaAssigner:
         return partial
 
     def _effective_split_weight(self, group: AllocationGroup) -> float:
-        if group.column_demand >= self.config.large_group_column_threshold:
-            return self.config.split_weight * self.config.large_group_split_discount
-        if group.column_demand <= 2:
-            return self.config.split_weight * self.config.small_group_split_premium
-        return self.config.split_weight
+        total_containers = max(1, group.container_count)
+        target = self._target_containers_per_area(group)
+        size_factor = min(1.0, target / total_containers)
+        if total_containers <= 100:
+            group_class_factor = 1.4
+        elif total_containers <= 300:
+            group_class_factor = 1.0
+        else:
+            group_class_factor = 0.7
+        return self.config.base_split_weight * size_factor * group_class_factor
 
     def _try_assign_group(
         self,
@@ -944,6 +961,16 @@ class Stage1YardAreaAssigner:
             context,
             base_cost,
         )
+        candidates.extend(
+            self._proactive_split_candidates(
+                partial,
+                group,
+                group_by_id,
+                yard_areas,
+                context,
+                base_cost,
+            )
+        )
         if not candidates:
             split_candidate = self._repair_group_with_split(
                 partial,
@@ -957,7 +984,17 @@ class Stage1YardAreaAssigner:
                 candidates.append(split_candidate)
         if not candidates:
             return None
-        return self._select_repair_candidate(candidates)
+        required_areas = self._min_required_area_count(group)
+        if required_areas > 1:
+            multi_area = [
+                candidate
+                for candidate in candidates
+                if len({placement.area_id for placement in candidate.placements})
+                >= required_areas
+            ]
+            if multi_area:
+                candidates = multi_area
+        return self._select_repair_candidate(candidates, group)
 
     def _full_assignment_candidates(
         self,
@@ -999,8 +1036,201 @@ class Stage1YardAreaAssigner:
                     previews=[(area.area_id, preview)],
                 )
             )
-        full_candidates.sort(key=self._candidate_sort_key)
+        full_candidates.sort(key=lambda candidate: self._candidate_sort_key(candidate, group))
         return full_candidates
+
+    def _proactive_split_candidates(
+        self,
+        partial: Stage1Solution,
+        group: AllocationGroup,
+        group_by_id: Dict[str, AllocationGroup],
+        yard_areas: List[YardArea],
+        context: Stage1CostContext,
+        base_cost: float,
+    ) -> List[Stage1AssignmentCandidate]:
+        max_parts = min(
+            self.config.max_split_parts,
+            group.column_demand,
+            sum(
+                1
+                for area in yard_areas
+                if ConstraintChecker.can_assign_to_area(group, area)
+            ),
+        )
+        if max_parts < 2:
+            return []
+
+        target = self._target_containers_per_area(group)
+        desired_parts = max(2, math.ceil(max(1, group.container_count) / target))
+        candidate_part_counts = sorted(set(range(2, min(max_parts, desired_parts + 1) + 1)))
+        candidates: List[Stage1AssignmentCandidate] = []
+        seen_shapes: Set[Tuple[Tuple[str, int], ...]] = set()
+
+        for part_count in candidate_part_counts:
+            column_demands = self._balanced_column_demands(
+                group.column_demand,
+                part_count,
+            )
+            candidate = self._build_balanced_split_candidate(
+                partial,
+                group,
+                group_by_id,
+                yard_areas,
+                context,
+                base_cost,
+                column_demands,
+            )
+            if candidate is None or len(candidate.placements) <= 1:
+                continue
+            shape = tuple(
+                sorted(
+                    (placement.area_id, placement.column_demand)
+                    for placement in candidate.placements
+                )
+            )
+            if shape in seen_shapes:
+                continue
+            seen_shapes.add(shape)
+            candidates.append(candidate)
+
+        candidates.sort(key=lambda candidate: self._candidate_sort_key(candidate, group))
+        return candidates
+
+    def _build_balanced_split_candidate(
+        self,
+        partial: Stage1Solution,
+        group: AllocationGroup,
+        group_by_id: Dict[str, AllocationGroup],
+        yard_areas: List[YardArea],
+        context: Stage1CostContext,
+        base_cost: float,
+        column_demands: List[int],
+    ) -> Optional[Stage1AssignmentCandidate]:
+        placements: List[Stage1Placement] = []
+        local_previews: List[Tuple[str, PlacementPreview]] = []
+        used_area_ids = set()
+        temp_context = context.clone()
+        assigned = 0
+
+        for part_columns in column_demands:
+            area_candidates: List[Tuple[float, int, str, PlacementPreview]] = []
+            for area in yard_areas:
+                if area.area_id in used_area_ids:
+                    continue
+                if not ConstraintChecker.can_assign_to_area(group, area):
+                    continue
+                if part_columns > self._planning_remaining_capacity(
+                    area.area_id,
+                    temp_context.area_load,
+                    temp_context.states,
+                ):
+                    continue
+                preview = temp_context.states[area.area_id].preview_place(
+                    group,
+                    demand=part_columns,
+                )
+                if not preview.feasible:
+                    continue
+
+                trial_placements = placements + [
+                    Stage1Placement(group.group_id, area.area_id, part_columns)
+                ]
+                provisional_group_by_id = dict(group_by_id)
+                provisional_column_demand = assigned + part_columns
+                if group.column_demand > 0:
+                    provisional_container_count = max(
+                        0,
+                        round(
+                            group.container_count
+                            * provisional_column_demand
+                            / group.column_demand
+                        ),
+                    )
+                else:
+                    provisional_container_count = max(0, group.container_count)
+                provisional_group_by_id[group.group_id] = replace(
+                    group,
+                    containers=[],
+                    column_demand=provisional_column_demand,
+                    container_count=provisional_container_count,
+                )
+                delta_cost = self.evaluate_placement_delta(
+                    partial,
+                    provisional_group_by_id[group.group_id],
+                    trial_placements,
+                    local_previews + [(area.area_id, preview)],
+                    provisional_group_by_id,
+                    yard_areas,
+                    base_cost=base_cost,
+                )
+                if math.isinf(delta_cost):
+                    continue
+                step_workload = self._area_step_workload(
+                    temp_context,
+                    area.area_id,
+                    self._primary_target_step_id(group),
+                )[2]
+                area_candidates.append(
+                    (
+                        delta_cost,
+                        step_workload,
+                        temp_context.area_load.get(area.area_id, 0),
+                        area.area_id,
+                        preview,
+                    )
+                )
+
+            if not area_candidates:
+                return None
+
+            area_candidates.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+            _delta_cost, _step_workload, _area_load, area_id, preview = area_candidates[0]
+            temp_context.states[area_id].apply_preview(preview)
+            temp_context.area_load[area_id] += part_columns
+            temp_context.line_area_load[(group.line_key, area_id)] += part_columns
+            temp_context.physical_cost += preview.physical_cost
+            assigned += part_columns
+            local_previews.append((area_id, preview))
+            placements.append(Stage1Placement(group.group_id, area_id, part_columns))
+            used_area_ids.add(area_id)
+
+        final_delta = self.evaluate_placement_delta(
+            partial,
+            group,
+            placements,
+            local_previews,
+            group_by_id,
+            yard_areas,
+            base_cost=base_cost,
+        )
+        if math.isinf(final_delta):
+            return None
+        return Stage1AssignmentCandidate(
+            delta_cost=final_delta,
+            placements=placements,
+            previews=local_previews,
+        )
+
+    def _primary_target_step_id(self, group: AllocationGroup) -> int:
+        if self.workload_snapshot is None:
+            return 0
+        target_step_ids = self.workload_snapshot.target_step_ids
+        if group.voyage_id in target_step_ids:
+            return target_step_ids[group.voyage_id]
+        if target_step_ids:
+            return next(iter(target_step_ids.values()))
+        if self._time_steps:
+            return self._time_steps[0].step_id
+        return 0
+
+    @staticmethod
+    def _balanced_column_demands(total_columns: int, part_count: int) -> List[int]:
+        base = total_columns // part_count
+        remainder = total_columns % part_count
+        return [
+            base + (1 if index < remainder else 0)
+            for index in range(part_count)
+        ]
 
     def _repair_group_with_split(
         self,
@@ -1114,21 +1344,47 @@ class Stage1YardAreaAssigner:
     def _select_repair_candidate(
         self,
         candidates: List[Stage1AssignmentCandidate],
+        group: AllocationGroup,
     ) -> Stage1AssignmentCandidate:
-        candidates.sort(key=self._candidate_sort_key)
+        candidates.sort(key=lambda candidate: self._candidate_sort_key(candidate, group))
         if not self.config.repair_random_tie_break:
             return candidates[0]
+        best_cost = candidates[0].delta_cost
         top_k = max(1, min(self.config.repair_top_k, len(candidates)))
-        return self._rng.choice(candidates[:top_k])
+        tied_candidates = [
+            candidate
+            for candidate in candidates[:top_k]
+            if candidate.delta_cost <= best_cost + self.config.repair_tie_tolerance
+        ]
+        return self._rng.choice(tied_candidates)
 
     def _candidate_sort_key(
         self,
         candidate: Stage1AssignmentCandidate,
-    ) -> Tuple[float, int, Tuple[Tuple[str, int], ...]]:
+        group: AllocationGroup,
+    ) -> Tuple[float, int, int, Tuple[Tuple[str, int], ...]]:
+        unique_areas = len({placement.area_id for placement in candidate.placements})
+        if group.container_count > self._target_containers_per_area(group):
+            area_rank = -unique_areas
+        else:
+            area_rank = len(candidate.placements)
         return (
             candidate.delta_cost,
+            area_rank,
             len(candidate.placements),
             tuple((placement.area_id, placement.column_demand) for placement in candidate.placements),
+        )
+
+    def _min_required_area_count(self, group: AllocationGroup) -> int:
+        if group.container_count <= 100:
+            return 1
+        target = self._target_containers_per_area(group)
+        desired = math.ceil(max(1, group.container_count) / target)
+        compatible = max(1, group.column_demand)
+        return min(
+            self.config.max_split_parts,
+            compatible,
+            max(2, desired),
         )
 
     def _replay_solution(
@@ -1320,11 +1576,25 @@ class Stage1YardAreaAssigner:
                 ]
                 if not workloads:
                     continue
+                soft_target = self._workload_area_soft_target(business_type)
+                overload = sum(
+                    max(0.0, workload - soft_target) ** 2 for workload in workloads
+                )
                 spread = max(workloads) - min(workloads)
+                total_cost += weight * self.config.workload_overload_weight * overload
                 total_cost += (
-                    weight * self.config.workload_balance_weight * spread * spread
+                    weight
+                    * self.config.workload_balance_weight
+                    * self.config.workload_spread_weight_scale
+                    * spread
+                    * spread
                 )
         return total_cost
+
+    def _workload_area_soft_target(self, business_type: BusinessType) -> float:
+        if business_type == BusinessType.EXPORT:
+            return max(1.0, self.config.workload_area_soft_target_export)
+        return max(1.0, self.config.workload_area_soft_target_import)
 
     def _iter_relevant_workload_steps(self) -> List[Tuple[int, float]]:
         if self.workload_snapshot is None:
@@ -1541,7 +1811,37 @@ class Stage1YardAreaAssigner:
                     )
         return cost
 
-    def _split_cost(
+    def _group_dispersion_cost(
+        self,
+        solution: Stage1Solution,
+        group_by_id: Dict[str, AllocationGroup],
+    ) -> float:
+        cost = 0.0
+        min_part = max(1.0, float(self.config.min_split_part_containers))
+        for group_id, placements in solution.placements_by_group.items():
+            group = group_by_id.get(group_id)
+            if group is None or not placements:
+                continue
+            placement_counts = self._placement_container_counts(group, placements)
+            if not placement_counts:
+                continue
+
+            target = self._target_containers_per_area(group)
+            peak = max(placement_counts)
+            peak_excess_ratio = max(0.0, (peak - target) / target)
+            cost += self.config.group_peak_weight * peak_excess_ratio ** 2
+            if peak > target:
+                cost += self.config.group_peak_weight * 0.5 * (
+                    (peak - target) / max(1.0, group.container_count)
+                )
+
+            if len(placements) > 1:
+                for count in placement_counts:
+                    fragment_ratio = max(0.0, (min_part - count) / min_part)
+                    cost += self.config.fragment_weight * fragment_ratio ** 2
+        return cost
+
+    def _split_operation_cost(
         self,
         solution: Stage1Solution,
         group_by_id: Dict[str, AllocationGroup],
@@ -1556,6 +1856,11 @@ class Stage1YardAreaAssigner:
                     split_weight = self._effective_split_weight(group)
                 cost += split_weight * (part_count - 1) ** 2
         return cost
+
+    def _target_containers_per_area(self, group: AllocationGroup) -> float:
+        if group.business_type == BusinessType.EXPORT:
+            return max(1.0, float(self.config.export_target_containers_per_area))
+        return max(1.0, float(self.config.import_target_containers_per_area))
 
     def _difficulty_key(
         self,

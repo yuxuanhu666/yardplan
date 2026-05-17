@@ -36,6 +36,10 @@ class Stage2ScipConfig:
     time_limit_seconds: float = 20.0
     unmet_weight: float = 1_000_000.0
     segment_weight: float = 1_000.0
+    region_component_weight: float = 250.0
+    enforce_stack_contiguity: bool = True
+    segment_min_fill_ratio: float = 0.65
+    max_underfilled_segments_per_item: int = 2
     crane_balance_weight: float = 10.0
     stability_weight: float = 0.001
 
@@ -120,6 +124,8 @@ class ScipStage2BayAllocator:
         used_20ft_bays: Dict[int, Any] = {}
         used_large_pairs: Dict[BaySpec, Any] = {}
         large_pairs_by_bay: Dict[int, List[Any]] = defaultdict(list)
+        segment_stack_vars: Dict[Tuple[str, BaySpec], Dict[int, Any]] = defaultdict(dict)
+        item_segments: Dict[str, Dict[BaySpec, Any]] = defaultdict(dict)
 
         for item_key, (assignment, group) in zip(item_keys, items):
             demand = max(0, int(assignment.column_demand))
@@ -143,7 +149,9 @@ class ScipStage2BayAllocator:
                         vtype="B",
                         name=f"seg_{item_key}_{self._segment_name(segment_key)}",
                     )
+                    item_segments[item_key][segment_key] = y[(item_key, segment_key)]
                 model.addCons(var <= y[(item_key, segment_key)])
+                segment_stack_vars[(item_key, segment_key)][option.stack_index] = var
 
                 for atom in option.atoms:
                     atom_to_vars[atom].append(var)
@@ -171,6 +179,17 @@ class ScipStage2BayAllocator:
             placed = quicksum(item_vars) if item_vars else 0
             placed_expr[item_key] = placed
             model.addCons(placed + unmet[item_key] == demand, name=f"demand_{item_key}")
+
+        region_start_terms: List[Any] = []
+        if self.config.enforce_stack_contiguity:
+            self._add_stack_contiguity_constraints(model, segment_stack_vars)
+        self._add_segment_fill_constraints(
+            model,
+            segment_stack_vars,
+            item_segments,
+            item_keys,
+            region_start_terms,
+        )
 
         for atom, atom_vars in sorted(atom_to_vars.items()):
             model.addCons(quicksum(atom_vars) <= 1, name=f"atom_{atom[0]}_{atom[1]}")
@@ -214,6 +233,7 @@ class ScipStage2BayAllocator:
         objective = (
             self.config.unmet_weight * quicksum(unmet.values())
             + self.config.segment_weight * quicksum(y.values())
+            + self.config.region_component_weight * quicksum(region_start_terms)
             + self.config.crane_balance_weight * balance
             + self.config.stability_weight * quicksum(stability_terms)
         )
@@ -244,6 +264,120 @@ class ScipStage2BayAllocator:
             allocations.append(allocation)
 
         return allocations
+
+    def _add_stack_contiguity_constraints(
+        self,
+        model: Any,
+        segment_stack_vars: Dict[Tuple[str, BaySpec], Dict[int, Any]],
+    ) -> None:
+        """
+        For one item in one bay/large-bay segment, selected stacks must form
+        a physical contiguous interval. This prevents shapes like stack 1 and
+        stack 9 with holes in between.
+        """
+        for (item_key, segment), stack_vars in segment_stack_vars.items():
+            stacks = sorted(int(stack) for stack in stack_vars)
+            if len(stacks) <= 2:
+                continue
+            segment_name = self._segment_name(segment)
+            for left_index, left_stack in enumerate(stacks[:-2]):
+                left_var = stack_vars[left_stack]
+                for right_stack in stacks[left_index + 2 :]:
+                    right_var = stack_vars[right_stack]
+                    for middle_stack in range(left_stack + 1, right_stack):
+                        middle_var = stack_vars.get(middle_stack)
+                        if middle_var is None:
+                            model.addCons(
+                                left_var + right_var <= 1,
+                                name=(
+                                    f"stack_no_missing_gap_{item_key}_"
+                                    f"{segment_name}_{left_stack}_{right_stack}"
+                                ),
+                            )
+                            break
+                        model.addCons(
+                            left_var + right_var - 1 <= middle_var,
+                            name=(
+                                f"stack_no_gap_{item_key}_{segment_name}_"
+                                f"{left_stack}_{middle_stack}_{right_stack}"
+                            ),
+                        )
+
+    def _add_segment_fill_constraints(
+        self,
+        model: Any,
+        segment_stack_vars: Dict[Tuple[str, BaySpec], Dict[int, Any]],
+        item_segments: Dict[str, Dict[BaySpec, Any]],
+        item_keys: List[str],
+        region_start_terms: List[Any],
+    ) -> None:
+        """
+        Encourage each used bay/large-bay segment to be a real compact block.
+
+        Most used segments must reach a minimum fill depth; only a small number
+        of tail segments may be underfilled. Region starts are penalized so an
+        item can have several blocks, but unnecessary bay-axis fragmentation is
+        discouraged.
+        """
+        min_fill_ratio = max(0.0, min(1.0, self.config.segment_min_fill_ratio))
+        max_underfilled = max(1, int(self.config.max_underfilled_segments_per_item))
+
+        for item_key in item_keys:
+            segments = item_segments.get(item_key, {})
+            if not segments:
+                continue
+
+            underfilled_terms: List[Any] = []
+            for segment, segment_var in segments.items():
+                stack_vars = segment_stack_vars.get((item_key, segment), {})
+                if not stack_vars:
+                    continue
+                capacity = len(stack_vars)
+                threshold = max(1, min(capacity, int(math.ceil(capacity * min_fill_ratio))))
+                underfilled = model.addVar(
+                    vtype="B",
+                    name=f"underfill_{item_key}_{self._segment_name(segment)}",
+                )
+                fill_expr = sum(stack_vars.values())
+                model.addCons(
+                    fill_expr + threshold * underfilled >= threshold * segment_var,
+                    name=f"segment_min_fill_{item_key}_{self._segment_name(segment)}",
+                )
+                model.addCons(
+                    underfilled <= segment_var,
+                    name=f"underfill_active_{item_key}_{self._segment_name(segment)}",
+                )
+                underfilled_terms.append(underfilled)
+
+            if underfilled_terms:
+                model.addCons(
+                    sum(underfilled_terms) <= max_underfilled,
+                    name=f"underfill_limit_{item_key}",
+                )
+
+            previous_segment_var: Optional[Any] = None
+            for segment in sorted(segments, key=self._bay_spec_sort_key):
+                segment_var = segments[segment]
+                start_var = model.addVar(
+                    vtype="B",
+                    name=f"region_start_{item_key}_{self._segment_name(segment)}",
+                )
+                if previous_segment_var is None:
+                    model.addCons(
+                        start_var >= segment_var,
+                        name=f"region_first_start_{item_key}_{self._segment_name(segment)}",
+                    )
+                else:
+                    model.addCons(
+                        start_var >= segment_var - previous_segment_var,
+                        name=f"region_start_link_{item_key}_{self._segment_name(segment)}",
+                    )
+                model.addCons(
+                    start_var <= segment_var,
+                    name=f"region_start_active_{item_key}_{self._segment_name(segment)}",
+                )
+                region_start_terms.append(start_var)
+                previous_segment_var = segment_var
 
     def _build_options(
         self,
