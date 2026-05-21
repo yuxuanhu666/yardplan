@@ -1974,6 +1974,14 @@ class Stage2BayAllocator:
 
     The implementation delegates to the SCIP model in `stage2_scip` while
     keeping the historical public interface unchanged.
+
+    Sibling split groups that share the same parent and yard area are merged into
+    one Stage2 item before solving so bay-axis fragmentation penalties apply to a
+    single demand block (see `merge_same_parent_assignments_for_stage2`).
+
+    Returns ``(bay_allocations, merged_area_assignments)`` — the latter replaces
+    sibling rows with one combined assignment per parent so it stays consistent
+    with Stage2 output.
     """
 
     def __init__(self, scip_config=None):
@@ -1984,14 +1992,24 @@ class Stage2BayAllocator:
         area_assignments: List[AreaAssignment],
         groups: Dict[str, AllocationGroup],
         yard_areas: Dict[str, YardArea],
-    ) -> List[BayColumnAllocation]:
-        from yardplan_core.stage2_scip import ScipStage2BayAllocator
+    ) -> Tuple[List[BayColumnAllocation], List[AreaAssignment]]:
+        from yardplan_core.stage2_scip import (
+            ScipStage2BayAllocator,
+            log_stage2_merged_parent_contiguity,
+            merge_same_parent_assignments_for_stage2,
+        )
 
-        return ScipStage2BayAllocator(self.scip_config).allocate(
+        merged_assignments, merged_keys = merge_same_parent_assignments_for_stage2(
             area_assignments,
+            groups,
+        )
+        allocations = ScipStage2BayAllocator(self.scip_config).allocate(
+            merged_assignments,
             groups,
             yard_areas,
         )
+        log_stage2_merged_parent_contiguity(allocations, merged_keys)
+        return allocations, merged_assignments
 
 
 class AllocationEngine:
@@ -2014,7 +2032,7 @@ class AllocationEngine:
         self.stage1.set_workload_snapshot(workload_snapshot)
         area_assignments, unassigned = self.stage1.assign(groups, yard_areas)
         group_dict = {group.group_id: group for group in groups}
-        bay_allocations = self.stage2.allocate(
+        bay_allocations, area_assignments = self.stage2.allocate(
             area_assignments,
             group_dict,
             {area.area_id: area for area in yard_areas},

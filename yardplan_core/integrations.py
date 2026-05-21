@@ -55,13 +55,10 @@ class YardSpaceAdapter:
                 bay_groups[bay_idx].append(((block_id, bay_idx, stack_idx), stack_info))
 
             sorted_bay_idxs = sorted(bay_groups.keys())
-            physical_bay_idxs = sorted(
-                {idx for idx in sorted_bay_idxs if idx % 2 == 1}
-                | {idx + 1 for idx in sorted_bay_idxs if idx % 2 == 0}
-            )
-            first_bay_idx = physical_bay_idxs[0]
-            last_bay_idx = physical_bay_idxs[-1]
+            first_bay_idx = sorted_bay_idxs[0]
+            last_bay_idx = sorted_bay_idxs[-1]
             bays: List[Bay] = []
+            bays_by_number: Dict[int, Bay] = {}
             large_bay_pairs: List[LargeBayPair] = []
             stage2_single_slots: List[Dict[str, int]] = []
             stage2_large_slots: List[Dict[str, Any]] = []
@@ -69,6 +66,7 @@ class YardSpaceAdapter:
                 yard,
                 block_id,
                 stack_dict,
+                sorted_bay_idxs,
             )
 
             for bay_idx in sorted_bay_idxs:
@@ -80,61 +78,57 @@ class YardSpaceAdapter:
                     if stack_info.get("next_placeable_tier") is not None
                 )
                 occupied = total - free
-                related_bays = YardSpaceAdapter._related_40ft_bays_for_group(
-                    yard,
-                    stacks_in_bay,
-                    fallback_bays=(bay_idx, bay_idx + 1),
+                bay_obj = Bay(
+                    bay_id=f"{block_id}-{bay_idx}",
+                    bay_number=bay_idx,
+                    yard_area_id=block_id,
+                    total_columns=total,
+                    occupied_columns=occupied,
+                    is_in_large_bay=False,
                 )
-                is_edge = min(related_bays) == first_bay_idx or max(related_bays) == last_bay_idx
+                bays.append(bay_obj)
+                bays_by_number[bay_idx] = bay_obj
+                slot_registry[bay_obj.bay_id] = stacks_in_bay
 
-                if bay_idx % 2 == 1:
-                    bay_obj = Bay(
-                        bay_id=f"{block_id}-{bay_idx}",
-                        bay_number=bay_idx,
-                        yard_area_id=block_id,
-                        total_columns=total,
-                        occupied_columns=occupied,
-                        is_in_large_bay=False,
+                for (stack_key, stack_info) in stacks_in_bay:
+                    bay_number = int(stack_key[1])
+                    if bay_number in existing_large_bays:
+                        continue
+                    if YardSpaceAdapter._is_empty_20ft_column(stack_info):
+                        stage2_single_slots.append(
+                            {
+                                "bay_number": bay_number,
+                                "stack_index": int(stack_key[2]),
+                            }
+                        )
+
+            seen_large_slots: Set[Tuple[Tuple[int, int], int]] = set()
+            for pair_start, pair_end in zip(sorted_bay_idxs[::2], sorted_bay_idxs[1::2]):
+                if pair_end != pair_start + 1:
+                    logger.warning(
+                        f"Block {block_id} 跳过非相邻 40ft 大贝对 ({pair_start}, {pair_end})"
                     )
-                    bays.append(bay_obj)
-                    slot_registry[bay_obj.bay_id] = stacks_in_bay
-                    for (stack_key, stack_info) in stacks_in_bay:
-                        if int(stack_key[1]) in existing_large_bays:
+                    continue
+
+                pair_bays = (pair_start, pair_end)
+                is_edge = pair_start == first_bay_idx or pair_end == last_bay_idx
+                pair = LargeBayPair(
+                    pair_id=f"{block_id}-40-{pair_start}_{pair_end}",
+                    yard_area_id=block_id,
+                    bay_a=bays_by_number[pair_start],
+                    bay_b=bays_by_number[pair_end],
+                    is_edge_pair=is_edge,
+                )
+                large_bay_pairs.append(pair)
+                slot_registry[pair.pair_id] = [
+                    *bay_groups.get(pair_start, []),
+                    *bay_groups.get(pair_end, []),
+                ]
+
+                for bay_idx in pair_bays:
+                    for (stack_key, stack_info) in bay_groups.get(bay_idx, []):
+                        if not YardSpaceAdapter._is_empty_40ft_column(stack_info):
                             continue
-                        if YardSpaceAdapter._is_empty_20ft_column(stack_info):
-                            stage2_single_slots.append(
-                                {
-                                    "bay_number": int(stack_key[1]),
-                                    "stack_index": int(stack_key[2]),
-                                }
-                            )
-                else:
-                    bay_a = Bay(
-                        bay_id=f"{block_id}-{bay_idx}-A",
-                        bay_number=related_bays[0],
-                        yard_area_id=block_id,
-                        total_columns=total,
-                        occupied_columns=occupied,
-                        is_in_large_bay=True,
-                    )
-                    bay_b = Bay(
-                        bay_id=f"{block_id}-{bay_idx}-B",
-                        bay_number=related_bays[1],
-                        yard_area_id=block_id,
-                        total_columns=total,
-                        occupied_columns=occupied,
-                        is_in_large_bay=True,
-                    )
-                    pair = LargeBayPair(
-                        pair_id=f"{block_id}-40-{bay_idx}",
-                        yard_area_id=block_id,
-                        bay_a=bay_a,
-                        bay_b=bay_b,
-                        is_edge_pair=is_edge,
-                    )
-                    large_bay_pairs.append(pair)
-                    slot_registry[pair.pair_id] = stacks_in_bay
-                    for (stack_key, stack_info) in stacks_in_bay:
                         slot_40ft = YardSpaceAdapter._first_tier_value(
                             stack_info,
                             "slot_40ft",
@@ -142,26 +136,29 @@ class YardSpaceAdapter:
                         actual_bays = YardSpaceAdapter._related_40ft_bays(
                             yard,
                             slot_40ft,
-                            fallback_bays=related_bays,
+                            fallback_bays=pair_bays,
                         )
+                        if tuple(sorted(actual_bays)) != pair_bays:
+                            continue
                         if (
-                            set(actual_bays) & existing_20ft_bays
-                            or set(actual_bays) & existing_large_bays
+                            set(pair_bays) & existing_20ft_bays
+                            or set(pair_bays) & existing_large_bays
                         ):
                             continue
-                        if YardSpaceAdapter._is_empty_40ft_column(stack_info):
-                            stage2_large_slots.append(
-                                {
-                                    "pair_id": pair.pair_id,
-                                    "bay_numbers": actual_bays,
-                                    "display_bays": actual_bays,
-                                    "stack_index": int(stack_key[2]),
-                                    "is_edge_pair": (
-                                        min(actual_bays) == first_bay_idx
-                                        or max(actual_bays) == last_bay_idx
-                                    ),
-                                }
-                            )
+                        stack_index = int(stack_key[2])
+                        slot_key = (pair_bays, stack_index)
+                        if slot_key in seen_large_slots:
+                            continue
+                        seen_large_slots.add(slot_key)
+                        stage2_large_slots.append(
+                            {
+                                "pair_id": pair.pair_id,
+                                "bay_numbers": pair_bays,
+                                "display_bays": pair_bays,
+                                "stack_index": stack_index,
+                                "is_edge_pair": is_edge,
+                            }
+                        )
 
             area = YardArea(
                 area_id=block_id,
@@ -188,9 +185,15 @@ class YardSpaceAdapter:
         yard: Any,
         block_id: str,
         stack_dict: Dict[Tuple[int, int], Dict[str, Any]],
+        bay_numbers: Optional[List[int]] = None,
     ) -> Tuple[Set[int], Set[int]]:
         existing_20ft_bays: Set[int] = set()
         existing_large_bays: Set[int] = set()
+        block_bays = sorted(
+            bay_numbers
+            if bay_numbers is not None
+            else {bay_idx for bay_idx, _stack_idx in stack_dict}
+        )
 
         for (bay_idx, _stack_idx), stack_info in stack_dict.items():
             for tier_data in (stack_info.get("tiers") or {}).values():
@@ -200,14 +203,22 @@ class YardSpaceAdapter:
                     if size == "20ft":
                         existing_20ft_bays.add(int(bay_idx))
                     elif size in ("40ft", "45ft"):
-                        existing_large_bays.add(int(bay_idx))
+                        existing_large_bays.update(
+                            YardSpaceAdapter._canonical_40ft_pair_for_bay(
+                                int(bay_idx),
+                                block_bays,
+                            )
+                        )
 
                 slot_40ft = tier_data.get("slot_40ft")
                 if slot_40ft and slot_40ft in getattr(yard, "occupied_40ft", set()):
                     related_bays = YardSpaceAdapter._related_40ft_bays(
                         yard,
                         slot_40ft,
-                        fallback_bays=(int(bay_idx), int(bay_idx) + 1),
+                        fallback_bays=YardSpaceAdapter._canonical_40ft_pair_for_bay(
+                            int(bay_idx),
+                            block_bays,
+                        ),
                     )
                     existing_large_bays.update(related_bays)
 
@@ -220,11 +231,29 @@ class YardSpaceAdapter:
             related_bays = YardSpaceAdapter._related_40ft_bays(
                 yard,
                 slot_name,
-                fallback_bays=(bay_idx, bay_idx + 1),
+                fallback_bays=YardSpaceAdapter._canonical_40ft_pair_for_bay(
+                    bay_idx,
+                    block_bays,
+                ),
             )
             existing_large_bays.update(related_bays)
 
         return existing_20ft_bays, existing_large_bays
+
+    @staticmethod
+    def _canonical_40ft_pair_for_bay(
+        bay_idx: int,
+        bay_numbers: List[int],
+    ) -> Tuple[int, int]:
+        """
+        Map any physical bay to the non-overlapping 40ft pair sequence:
+        (1,2), (3,4), (5,6), ... within a block's bay axis.
+        """
+        ordered = sorted(set(int(value) for value in bay_numbers))
+        for left, right in zip(ordered[::2], ordered[1::2]):
+            if bay_idx in (left, right):
+                return (left, right)
+        return (bay_idx, bay_idx + 1)
 
     @staticmethod
     def _is_empty_20ft_column(stack_info: Dict[str, Any]) -> bool:

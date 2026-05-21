@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import colorsys
 import json
 import math
 import os
@@ -7,12 +8,52 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from yardplan_core.models import (
+    AllocationGroup,
     BayColumnAllocation,
     ContainerSize,
     PlanningResult,
     _DATA_DIR,
     logger,
 )
+
+
+def _distinct_hex_colors(count: int) -> List[str]:
+    """
+    Produce `count` fill colors spaced around the hue wheel (golden-ratio steps)
+    with staggered saturation/value so neighboring indices stay distinguishable.
+
+    Avoids modulo reuse of a short fixed palette when many allocation groups exist.
+    """
+    if count <= 0:
+        return []
+    golden = 0.618033988749895
+    out: List[str] = []
+    for i in range(count):
+        h = (i * golden) % 1.0
+        s = 0.58 + 0.32 * ((i % 7) / 6.0)
+        v = 0.78 + 0.18 * (((i // 7) % 4) / 3.0)
+        r, g, b = colorsys.hsv_to_rgb(h, s, v)
+        out.append(f"#{int(r * 255):02x}{int(g * 255):02x}{int(b * 255):02x}")
+    return out
+
+
+def _plan_parent_group_display_id(
+    plan_group_id: str,
+    groups_by_id: Dict[str, AllocationGroup],
+) -> str:
+    """规划项上的 `group_id` 若为子组则显示其父组 id，否则显示自身 id。"""
+    group = groups_by_id.get(plan_group_id)
+    if group is not None and group.parent_group_id:
+        return str(group.parent_group_id)
+    return str(plan_group_id)
+
+
+def _shorten_plan_label(text: str, max_chars: int) -> str:
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    if max_chars <= 1:
+        return text[:max_chars]
+    return text[: max_chars - 1] + "…"
 
 
 @dataclass
@@ -32,6 +73,10 @@ class YardVisualizationConfig:
     coordinate_scale: float = 1000.0
     show_bay_labels: bool = True
     show_stack_labels: bool = False
+    # 在规划色块中心标注父组 id（无父组则标注当前组 id）
+    show_plan_parent_group_label: bool = True
+    plan_group_label_fontsize: Optional[float] = None  # None 则按色块尺寸自动估算
+    plan_group_label_max_chars: int = 18
     show_legend: bool = True
     existing_color: str = "#9e9e9e"
     empty_edge_color: str = "#d0d0d0"
@@ -454,6 +499,53 @@ class YardVisualizer:
                 if cell:
                     ax.text(cell.x + cell.width / 2, cell.y - 0.05, str(stack_idx), ha="center", va="bottom", fontsize=5)
 
+    def _plan_label_fontsize(self, bbox_w: float, bbox_h: float) -> float:
+        """按色块几何尺寸粗略匹配字号（数据坐标）；显式配置优先。"""
+        if self.config.plan_group_label_fontsize is not None:
+            return float(self.config.plan_group_label_fontsize)
+        m = max(1e-6, min(bbox_w, bbox_h))
+        return float(max(4.0, min(9.0, m * 12.5)))
+
+    def _draw_plan_parent_center_label(
+        self,
+        ax: Any,
+        x0: float,
+        y0: float,
+        x1: float,
+        y1: float,
+        plan_group_id: str,
+        groups_by_id: Dict[str, AllocationGroup],
+        patheffects: Any,
+    ) -> None:
+        """在规划占位并集矩形中心绘制父组（或顶层组）简写 id。"""
+        if not self.config.show_plan_parent_group_label:
+            return
+        raw = _plan_parent_group_display_id(plan_group_id, groups_by_id)
+        label = _shorten_plan_label(raw, self.config.plan_group_label_max_chars)
+        if not label:
+            return
+        cx = (x0 + x1) / 2.0
+        cy = (y0 + y1) / 2.0
+        fs = self._plan_label_fontsize(x1 - x0, y1 - y0)
+        text = ax.text(
+            cx,
+            cy,
+            label,
+            ha="center",
+            va="center",
+            fontsize=fs,
+            color="#ffffff",
+            fontweight="bold",
+            clip_on=True,
+            zorder=6,
+        )
+        stroke_w = max(1.15, float(fs * 0.22))
+        text.set_path_effects(
+            [
+                patheffects.withStroke(linewidth=stroke_w, foreground="#232323"),
+            ]
+        )
+
     def _draw_planning_overlay(
         self,
         ax: Any,
@@ -462,6 +554,12 @@ class YardVisualizer:
         color_map: Dict[str, str],
         rectangle_cls: Any,
     ) -> None:
+        from matplotlib import patheffects as mpatheffects
+
+        groups_by_id: Dict[str, AllocationGroup] = {
+            g.group_id: g for g in (result.allocation_groups or [])
+        }
+
         for item in extract_planned_draw_items(result, layout):
             block = layout.blocks.get(item.block_id)
             if block is None:
@@ -472,11 +570,12 @@ class YardVisualizer:
                 continue
             conflict = any(cell.occupied for cell in cells)
 
+            x0 = min(cell.x for cell in cells)
+            y0 = min(cell.y for cell in cells)
+            x1 = max(cell.x + cell.width for cell in cells)
+            y1 = max(cell.y + cell.height for cell in cells)
+
             if item.is_spanning or item.bay_start != item.bay_end:
-                x0 = min(cell.x for cell in cells)
-                y0 = min(cell.y for cell in cells)
-                x1 = max(cell.x + cell.width for cell in cells)
-                y1 = max(cell.y + cell.height for cell in cells)
                 ax.add_patch(
                     rectangle_cls(
                         (x0, y0),
@@ -500,6 +599,9 @@ class YardVisualizer:
                             linewidth=2.0,
                         )
                     )
+                self._draw_plan_parent_center_label(
+                    ax, x0, y0, x1, y1, item.group_id, groups_by_id, mpatheffects
+                )
                 continue
 
             for cell in cells:
@@ -515,34 +617,19 @@ class YardVisualizer:
                         hatch="///" if cell.occupied else None,
                     )
                 )
+            self._draw_plan_parent_center_label(
+                ax, x0, y0, x1, y1, item.group_id, groups_by_id, mpatheffects
+            )
 
     def _group_colors(self, result: Optional[PlanningResult]) -> Dict[str, str]:
         if result is None:
             return {}
-        palette = [
-            "#1f77b4",
-            "#ff7f0e",
-            "#2ca02c",
-            "#d62728",
-            "#9467bd",
-            "#8c564b",
-            "#e377c2",
-            "#7f7f7f",
-            "#bcbd22",
-            "#17becf",
-            "#4c78a8",
-            "#f58518",
-            "#54a24b",
-            "#b279a2",
-            "#ff9da6",
-            "#9d755d",
-            "#bab0ac",
-        ]
         group_ids = []
         for item in extract_planned_draw_items(result, None):
             if item.group_id not in group_ids:
                 group_ids.append(item.group_id)
-        return {group_id: palette[index % len(palette)] for index, group_id in enumerate(group_ids)}
+        palette = _distinct_hex_colors(len(group_ids))
+        return dict(zip(group_ids, palette))
 
     def _draw_legend(self, ax: Any, result: Optional[PlanningResult], color_map: Dict[str, str], patch_cls: Any) -> None:
         if not self.config.show_legend:
