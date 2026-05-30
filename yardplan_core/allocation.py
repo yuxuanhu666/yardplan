@@ -495,7 +495,11 @@ class Stage1LNSConfig:
     large_group_column_threshold: int = 4
     max_iterations: int = 80
     no_improve_limit: int = 20
-    destroy_fraction: float = 0.25
+    destroy_fraction: float = 0.2
+    hotspot_area_count: int = 3
+    hotspot_destroy_fraction: Optional[float] = None
+    stage1_destroy_operator: str = "adaptive"
+    stage1_repair_operator: str = "adaptive"
     random_seed: int = 17
     time_limit_seconds: Optional[float] = None
     workload_provider: Optional[str] = "simulated"
@@ -530,6 +534,36 @@ class Stage1LNSConfig:
     repair_top_k: int = 5
     repair_random_tie_break: bool = True
     repair_tie_tolerance: float = 1e-6
+    repair_workload_penalty_weight: float = 0.3
+    repair_underload_reward_weight: float = 0.05
+    repair_physical_bias_weight: float = 1.0
+    repair_congestion_weight: float = 8.0
+    repair_split_bias_weight: float = 3.0
+    repair_congestion_load_ratio: float = 0.5
+    repair_regret_recompute_interval: int = 1
+    bay_pressure_workload_weight: float = 1.0
+    bay_pressure_group_weight: float = 0.5
+    bay_pressure_load_ratio_weight: float = 0.3
+    bay_pressure_fragment_weight: float = 1.2
+    bay_pressure_mix_weight: float = 0.4
+    bay_pressure_large_group_boost: float = 1.5
+    guard_competition_weight: float = 12.0
+    guard_fragment_weight: float = 6.0
+    guard_headroom_weight: float = 15.0
+    guard_workload_penalty_weight: float = 0.3
+    guard_split_weight: float = 3.0
+    guard_max_competition_ratio: float = 2.5
+    guard_min_headroom_ratio: float = 0.5
+    guard_large_group_column_threshold: int = 4
+    guard_regret_recompute_interval: int = 1
+    alns_reaction_factor: float = 0.2
+    alns_segment_length: int = 8
+    alns_reward_global_best: float = 8.0
+    alns_reward_improving: float = 4.0
+    alns_reward_accepted: float = 1.5
+    alns_reward_rejected: float = 0.0
+    alns_min_operator_weight: float = 0.2
+    alns_warmup_rounds: int = 1
 
 
 @dataclass
@@ -582,6 +616,15 @@ class Stage1AssignmentCandidate:
     delta_cost: float
     placements: List[Stage1Placement]
     previews: List[Tuple[str, PlacementPreview]]
+
+
+@dataclass
+class ALNSOperatorState:
+    weight: float = 1.0
+    segment_score: float = 0.0
+    segment_uses: int = 0
+    total_score: float = 0.0
+    total_uses: int = 0
 
 
 class AreaScoringStrategy(ABC):
@@ -644,6 +687,7 @@ class Stage1YardAreaAssigner:
         self._vessels: Dict[str, Vessel] = {}
         self._time_steps: List[TimeStep] = []
         self._voyage_step_span: Dict[str, List[int]] = {}
+        self._last_search_summary: Dict[str, object] = {}
 
     def _resolve_workload_provider(self) -> AreaWorkloadProvider:
         provider_name = (self.config.workload_provider or "simulated").lower()
@@ -752,8 +796,10 @@ class Stage1YardAreaAssigner:
                 groups.append(generated)
                 existing_ids.add(generated.group_id)
 
+        search_label = self._search_algorithm_label()
         logger.info(
-            "Stage1 LNS complete: %s assignments, %s split groups, %s unassigned",
+            "Stage1 %s complete: %s assignments, %s split groups, %s unassigned",
+            search_label,
             len(assignments),
             len(generated_groups),
             len(unassigned),
@@ -802,15 +848,35 @@ class Stage1YardAreaAssigner:
         no_improve = 0
         started_at = time.monotonic()
         temperature = self.config.sa_initial_temperature
+        destroy_pool = self._destroy_operator_pool()
+        repair_pool = self._repair_operator_pool()
+        destroy_states = {
+            operator: ALNSOperatorState() for operator in destroy_pool
+        }
+        repair_states = {
+            operator: ALNSOperatorState() for operator in repair_pool
+        }
+        adaptive_mode = self._use_adaptive_operator_selection()
+        iterations_completed = 0
 
-        for _iteration in range(self.config.max_iterations):
+        for iteration in range(self.config.max_iterations):
             if self.config.time_limit_seconds is not None:
                 if time.monotonic() - started_at >= self.config.time_limit_seconds:
                     break
             if no_improve >= self.config.no_improve_limit:
                 break
 
-            removed_ids = self._random_destroy(current)
+            destroy_operator = self._select_alns_operator(
+                iteration=iteration,
+                operators=destroy_pool,
+                states=destroy_states,
+            )
+            removed_ids = self._apply_destroy_operator(
+                current,
+                group_by_id,
+                yard_areas,
+                operator=destroy_operator,
+            )
             if not removed_ids:
                 break
 
@@ -819,11 +885,17 @@ class Stage1YardAreaAssigner:
                 candidate.placements_by_group.pop(group_id, None)
                 candidate.unassigned_group_ids.discard(group_id)
 
-            repaired = self._random_repair(
+            repair_operator = self._select_alns_operator(
+                iteration=iteration,
+                operators=repair_pool,
+                states=repair_states,
+            )
+            repaired = self._apply_repair_operator(
                 candidate,
                 removed_ids,
                 group_by_id,
                 yard_areas,
+                operator=repair_operator,
             )
             candidate_cost = self.evaluate(repaired, group_by_id, yard_areas)
 
@@ -835,6 +907,15 @@ class Stage1YardAreaAssigner:
                 and temperature >= self.config.sa_min_temperature
             ):
                 accept = self._rng.random() < math.exp(-delta / temperature)
+
+            reward = self._alns_iteration_reward(
+                candidate_cost=candidate_cost,
+                current_cost=current_cost,
+                best_cost=best_cost,
+                accepted=accept,
+            )
+            self._record_alns_feedback(destroy_states[destroy_operator], reward)
+            self._record_alns_feedback(repair_states[repair_operator], reward)
 
             if accept:
                 current = repaired
@@ -854,22 +935,156 @@ class Stage1YardAreaAssigner:
                     temperature * self.config.sa_cooling_rate,
                 )
 
+            iterations_completed = iteration + 1
+            if adaptive_mode:
+                self._maybe_refresh_alns_weights(
+                    iteration=iterations_completed,
+                    states=destroy_states,
+                )
+                self._maybe_refresh_alns_weights(
+                    iteration=iterations_completed,
+                    states=repair_states,
+                )
+
         self._log_workload_balance(best, group_by_id, yard_areas)
         self._log_unassigned_diagnostics(best, group_by_id, yard_areas)
+        self._last_search_summary = {
+            "search_label": self._search_algorithm_label(),
+            "iterations": iterations_completed,
+            "adaptive_mode": adaptive_mode,
+            "destroy": self._operator_summary(destroy_states),
+            "repair": self._operator_summary(repair_states),
+        }
+        self._log_alns_summary()
         if self.config.use_simulated_annealing:
             logger.info(
-                "Stage1 LNS best cost: %.3f, unassigned=%s (SA final T=%.4f)",
+                "Stage1 %s best cost: %.3f, unassigned=%s (SA final T=%.4f)",
+                self._search_algorithm_label(),
                 best_cost,
                 len(best.unassigned_group_ids),
                 temperature,
             )
         else:
             logger.info(
-                "Stage1 LNS best cost: %.3f, unassigned=%s",
+                "Stage1 %s best cost: %.3f, unassigned=%s",
+                self._search_algorithm_label(),
                 best_cost,
                 len(best.unassigned_group_ids),
             )
         return best
+
+    def _use_adaptive_operator_selection(self) -> bool:
+        destroy = (self.config.stage1_destroy_operator or "adaptive").lower()
+        repair = (self.config.stage1_repair_operator or "adaptive").lower()
+        return destroy == "adaptive" or repair == "adaptive"
+
+    def _search_algorithm_label(self) -> str:
+        return "ALNS" if self._use_adaptive_operator_selection() else "LNS"
+
+    def _destroy_operator_pool(self) -> List[str]:
+        destroy = (self.config.stage1_destroy_operator or "adaptive").lower()
+        if destroy == "adaptive":
+            return ["random", "workload_hotspot", "bay_pressure"]
+        return [destroy]
+
+    def _repair_operator_pool(self) -> List[str]:
+        repair = (self.config.stage1_repair_operator or "adaptive").lower()
+        if repair == "adaptive":
+            return ["random", "workload_balanced", "stage2_guarded"]
+        return [self._resolve_repair_operator()]
+
+    def _select_alns_operator(
+        self,
+        *,
+        iteration: int,
+        operators: List[str],
+        states: Dict[str, ALNSOperatorState],
+    ) -> str:
+        if len(operators) == 1:
+            return operators[0]
+        warmup_span = max(0, int(self.config.alns_warmup_rounds)) * len(operators)
+        if iteration < warmup_span:
+            return operators[iteration % len(operators)]
+
+        total_weight = sum(max(self.config.alns_min_operator_weight, states[op].weight) for op in operators)
+        draw = self._rng.random() * total_weight
+        cumulative = 0.0
+        for operator in operators:
+            cumulative += max(self.config.alns_min_operator_weight, states[operator].weight)
+            if draw <= cumulative:
+                return operator
+        return operators[-1]
+
+    def _alns_iteration_reward(
+        self,
+        *,
+        candidate_cost: float,
+        current_cost: float,
+        best_cost: float,
+        accepted: bool,
+    ) -> float:
+        if candidate_cost < best_cost:
+            return self.config.alns_reward_global_best
+        if candidate_cost < current_cost:
+            return self.config.alns_reward_improving
+        if accepted:
+            return self.config.alns_reward_accepted
+        return self.config.alns_reward_rejected
+
+    @staticmethod
+    def _record_alns_feedback(state: ALNSOperatorState, reward: float) -> None:
+        state.segment_score += reward
+        state.segment_uses += 1
+        state.total_score += reward
+        state.total_uses += 1
+
+    def _maybe_refresh_alns_weights(
+        self,
+        *,
+        iteration: int,
+        states: Dict[str, ALNSOperatorState],
+    ) -> None:
+        segment_length = max(1, int(self.config.alns_segment_length))
+        if iteration % segment_length != 0:
+            return
+        reaction = min(1.0, max(0.0, self.config.alns_reaction_factor))
+        min_weight = max(0.0, self.config.alns_min_operator_weight)
+        for state in states.values():
+            if state.segment_uses > 0:
+                average_reward = state.segment_score / state.segment_uses
+                state.weight = max(
+                    min_weight,
+                    (1.0 - reaction) * state.weight + reaction * average_reward,
+                )
+            else:
+                state.weight = max(min_weight, state.weight)
+            state.segment_score = 0.0
+            state.segment_uses = 0
+
+    @staticmethod
+    def _operator_summary(
+        states: Dict[str, ALNSOperatorState],
+    ) -> Dict[str, Dict[str, float]]:
+        summary: Dict[str, Dict[str, float]] = {}
+        for operator, state in states.items():
+            avg_reward = state.total_score / state.total_uses if state.total_uses else 0.0
+            summary[operator] = {
+                "weight": round(state.weight, 4),
+                "uses": float(state.total_uses),
+                "avg_reward": round(avg_reward, 4),
+            }
+        return summary
+
+    def _log_alns_summary(self) -> None:
+        if not self._last_search_summary:
+            return
+        logger.info(
+            "Stage1 %s operator summary: iterations=%s destroy=%s repair=%s",
+            self._last_search_summary.get("search_label", "LNS"),
+            self._last_search_summary.get("iterations", 0),
+            self._last_search_summary.get("destroy", {}),
+            self._last_search_summary.get("repair", {}),
+        )
 
     def evaluate(
         self,
@@ -913,6 +1128,351 @@ class Stage1YardAreaAssigner:
         remove_count = max(1, int(math.ceil(len(assigned_ids) * self.config.destroy_fraction)))
         return self._rng.sample(assigned_ids, min(remove_count, len(assigned_ids)))
 
+    def _apply_destroy_operator(
+        self,
+        solution: Stage1Solution,
+        group_by_id: Dict[str, AllocationGroup],
+        yard_areas: List[YardArea],
+        operator: Optional[str] = None,
+    ) -> List[str]:
+        op = operator or self.config.stage1_destroy_operator
+        if op == "bay_pressure":
+            return self._bay_pressure_destroy(
+                solution,
+                group_by_id,
+                yard_areas,
+            )
+        if op == "workload_hotspot":
+            return self._workload_hotspot_destroy(
+                solution,
+                group_by_id,
+                yard_areas,
+            )
+        if op == "random":
+            return self._random_destroy(solution)
+        raise ValueError(f"未知 stage1_destroy_operator: {op!r}")
+
+    def _workload_hotspot_destroy(
+        self,
+        solution: Stage1Solution,
+        group_by_id: Dict[str, AllocationGroup],
+        yard_areas: List[YardArea],
+    ) -> List[str]:
+        assigned_ids = list(solution.placements_by_group.keys())
+        if not assigned_ids:
+            return []
+        if self.workload_snapshot is None:
+            return self._random_destroy(solution)
+
+        fraction = (
+            self.config.hotspot_destroy_fraction
+            if self.config.hotspot_destroy_fraction is not None
+            else self.config.destroy_fraction
+        )
+        remove_count = max(1, int(math.ceil(len(assigned_ids) * fraction)))
+        context = self._replay_solution(solution, group_by_id, yard_areas)
+        area_scores = self._compute_area_hotspot_scores(context, yard_areas)
+        hotspot_area_ids = self._select_hotspot_area_ids(area_scores, context, yard_areas)
+        group_scores = self._score_groups_on_hotspot_areas(
+            solution,
+            group_by_id,
+            area_scores,
+            hotspot_area_ids,
+        )
+        if not any(score > 0.0 for score in group_scores.values()):
+            return self._random_destroy(solution)
+
+        ranked_group_ids = sorted(
+            [group_id for group_id, score in group_scores.items() if score > 0.0],
+            key=lambda group_id: (-group_scores[group_id], self._rng.random()),
+        )
+        removed_ids = ranked_group_ids[:remove_count]
+        target_count = min(remove_count, len(assigned_ids))
+        if len(removed_ids) < target_count:
+            remaining_ids = [
+                group_id for group_id in assigned_ids if group_id not in set(removed_ids)
+            ]
+            supplement_count = target_count - len(removed_ids)
+            if supplement_count > 0 and remaining_ids:
+                removed_ids.extend(
+                    self._rng.sample(
+                        remaining_ids,
+                        min(supplement_count, len(remaining_ids)),
+                    )
+                )
+
+        logger.debug(
+            "Stage1 hotspot destroy: hotspot_areas=%s remove_count=%s",
+            sorted(hotspot_area_ids),
+            len(removed_ids),
+        )
+        return removed_ids
+
+    def _bay_pressure_destroy(
+        self,
+        solution: Stage1Solution,
+        group_by_id: Dict[str, AllocationGroup],
+        yard_areas: List[YardArea],
+    ) -> List[str]:
+        assigned_ids = list(solution.placements_by_group.keys())
+        if not assigned_ids:
+            return []
+        if self.workload_snapshot is None:
+            return self._random_destroy(solution)
+
+        fraction = (
+            self.config.hotspot_destroy_fraction
+            if self.config.hotspot_destroy_fraction is not None
+            else self.config.destroy_fraction
+        )
+        remove_count = max(1, int(math.ceil(len(assigned_ids) * fraction)))
+        context = self._replay_solution(solution, group_by_id, yard_areas)
+        pressure_scores = self._compute_bay_pressure_scores(solution, context, yard_areas)
+        hotspot_area_ids = self._select_hotspot_area_ids(
+            pressure_scores,
+            context,
+            yard_areas,
+        )
+        group_scores = self._score_groups_on_hotspot_areas(
+            solution,
+            group_by_id,
+            pressure_scores,
+            hotspot_area_ids,
+        )
+        for group_id, score in list(group_scores.items()):
+            group = group_by_id.get(group_id)
+            if group is None or score <= 0.0:
+                continue
+            group_scores[group_id] = score * self._bay_pressure_group_boost(group)
+
+        if not any(score > 0.0 for score in group_scores.values()):
+            return self._random_destroy(solution)
+
+        ranked_group_ids = sorted(
+            [group_id for group_id, score in group_scores.items() if score > 0.0],
+            key=lambda group_id: (-group_scores[group_id], self._rng.random()),
+        )
+        removed_ids = ranked_group_ids[:remove_count]
+        target_count = min(remove_count, len(assigned_ids))
+        if len(removed_ids) < target_count:
+            remaining_ids = [
+                group_id for group_id in assigned_ids if group_id not in set(removed_ids)
+            ]
+            supplement_count = target_count - len(removed_ids)
+            if supplement_count > 0 and remaining_ids:
+                removed_ids.extend(
+                    self._rng.sample(
+                        remaining_ids,
+                        min(supplement_count, len(remaining_ids)),
+                    )
+                )
+
+        logger.debug(
+            "Stage1 bay-pressure destroy: hotspot_areas=%s remove_count=%s",
+            sorted(hotspot_area_ids),
+            len(removed_ids),
+        )
+        return removed_ids
+
+    def _compute_bay_pressure_scores(
+        self,
+        solution: Stage1Solution,
+        context: Stage1CostContext,
+        yard_areas: List[YardArea],
+    ) -> Dict[str, float]:
+        workload_scores = self._compute_area_hotspot_scores(context, yard_areas)
+        group_ids_by_area: Dict[str, Set[str]] = defaultdict(set)
+        for group_id, placements in solution.placements_by_group.items():
+            for placement in placements:
+                group_ids_by_area[placement.area_id].add(group_id)
+
+        scores: Dict[str, float] = {}
+        for area in yard_areas:
+            state = context.states[area.area_id]
+            capacity = max(1, self._planning_capacity(area.area_id, context.states))
+            load_ratio = context.area_load.get(area.area_id, 0) / capacity
+            mix_pressure = len(state.locked_20_bays) + len(state.locked_large_bays)
+            if state.locked_20_bays and state.locked_large_bays:
+                mix_pressure += len(state.locked_20_bays) * len(state.locked_large_bays)
+            scores[area.area_id] = (
+                self.config.bay_pressure_workload_weight
+                * workload_scores.get(area.area_id, 0.0)
+                + self.config.bay_pressure_group_weight
+                * math.log1p(len(group_ids_by_area.get(area.area_id, set())))
+                + self.config.bay_pressure_load_ratio_weight * load_ratio
+                + self.config.bay_pressure_fragment_weight
+                * self._area_fragmentation_score(state)
+                + self.config.bay_pressure_mix_weight * mix_pressure
+            )
+        return scores
+
+    def _bay_pressure_group_boost(self, group: AllocationGroup) -> float:
+        if group.size == ContainerSize.SIZE_45:
+            size_boost = 1.4
+        elif group.size == ContainerSize.SIZE_40:
+            size_boost = 1.2
+        else:
+            size_boost = 1.0
+        if group.column_demand >= self.config.large_group_column_threshold:
+            size_boost *= self.config.bay_pressure_large_group_boost
+        return size_boost
+
+    def _area_fragmentation_score(self, state: AreaResourceState) -> float:
+        partial_20ft_bays = sum(
+            1
+            for bay_number in state.locked_20_bays
+            if state.bay_free.get(bay_number, 0) > 0
+        )
+        partial_large_pairs = sum(
+            1
+            for bay_a, bay_b, _is_edge in state.pair_bays
+            if bay_a in state.locked_large_bays
+            and bay_b in state.locked_large_bays
+            and min(state.bay_free.get(bay_a, 0), state.bay_free.get(bay_b, 0)) > 0
+        )
+        return float(partial_20ft_bays + partial_large_pairs)
+
+    def _compute_area_hotspot_scores(
+        self,
+        context: Stage1CostContext,
+        yard_areas: List[YardArea],
+    ) -> Dict[str, float]:
+        scores = {area.area_id: 0.0 for area in yard_areas}
+        by_business: Dict[BusinessType, List[YardArea]] = defaultdict(list)
+        for area in yard_areas:
+            by_business[area.business_type].append(area)
+
+        for business_type in (BusinessType.IMPORT, BusinessType.EXPORT):
+            areas = by_business.get(business_type, [])
+            if not areas:
+                continue
+            for area in areas:
+                soft_target = self._workload_area_soft_target(area.business_type)
+                for step_id, weight in self._iter_relevant_workload_steps():
+                    if weight <= 0.0:
+                        continue
+                    workload = self._area_step_workload(context, area.area_id, step_id)[2]
+                    excess = max(0.0, workload - soft_target)
+                    scores[area.area_id] += weight * (excess ** 2)
+        return scores
+
+    def _select_hotspot_area_ids(
+        self,
+        scores: Dict[str, float],
+        context: Stage1CostContext,
+        yard_areas: List[YardArea],
+    ) -> Set[str]:
+        hotspot_area_ids: Set[str] = set()
+        by_business: Dict[BusinessType, List[YardArea]] = defaultdict(list)
+        relevant_step_ids = [
+            step_id
+            for step_id, weight in self._iter_relevant_workload_steps()
+            if weight > 0.0
+        ]
+        for area in yard_areas:
+            by_business[area.business_type].append(area)
+
+        for business_type in (BusinessType.IMPORT, BusinessType.EXPORT):
+            areas_bt = by_business.get(business_type, [])
+            if not areas_bt:
+                continue
+            hotspot_count = max(1, min(self.config.hotspot_area_count, len(areas_bt)))
+            positive_areas = [
+                area for area in areas_bt if scores.get(area.area_id, 0.0) > 0.0
+            ]
+            if positive_areas:
+                ranked_areas = sorted(
+                    positive_areas,
+                    key=lambda area: (-scores.get(area.area_id, 0.0), area.area_id),
+                )
+            else:
+                raw_peak = {
+                    area.area_id: max(
+                        (
+                            self._area_step_workload(context, area.area_id, step_id)[2]
+                            for step_id in relevant_step_ids
+                        ),
+                        default=0.0,
+                    )
+                    for area in areas_bt
+                }
+                ranked_areas = sorted(
+                    areas_bt,
+                    key=lambda area: (-raw_peak.get(area.area_id, 0.0), area.area_id),
+                )
+            hotspot_area_ids.update(
+                area.area_id for area in ranked_areas[:hotspot_count]
+            )
+        return hotspot_area_ids
+
+    def _score_groups_on_hotspot_areas(
+        self,
+        solution: Stage1Solution,
+        group_by_id: Dict[str, AllocationGroup],
+        scores: Dict[str, float],
+        hotspot_area_ids: Set[str],
+    ) -> Dict[str, float]:
+        group_scores: Dict[str, float] = {}
+        for group_id, placements in solution.placements_by_group.items():
+            group = group_by_id.get(group_id)
+            if group is None:
+                group_scores[group_id] = 0.0
+                continue
+            placement_container_counts = self._placement_container_counts(group, placements)
+            group_score = 0.0
+            for placement, n_containers in zip(placements, placement_container_counts):
+                if placement.area_id not in hotspot_area_ids:
+                    continue
+                group_score += n_containers * scores.get(placement.area_id, 0.0)
+            group_scores[group_id] = group_score
+        return group_scores
+
+    def _resolve_repair_operator(self) -> str:
+        repair = (self.config.stage1_repair_operator or "auto").lower()
+        if repair == "adaptive":
+            return "adaptive"
+        if repair == "auto":
+            if self.config.stage1_destroy_operator == "bay_pressure":
+                return "stage2_guarded"
+            if self.config.stage1_destroy_operator == "workload_hotspot":
+                return "workload_balanced"
+            return "random"
+        if repair in {"random", "workload_balanced", "stage2_guarded"}:
+            return repair
+        raise ValueError(f"未知 stage1_repair_operator: {self.config.stage1_repair_operator!r}")
+
+    def _apply_repair_operator(
+        self,
+        partial: Stage1Solution,
+        group_ids: List[str],
+        group_by_id: Dict[str, AllocationGroup],
+        yard_areas: List[YardArea],
+        operator: Optional[str] = None,
+    ) -> Stage1Solution:
+        op = (operator or self._resolve_repair_operator()).lower()
+        if op == "stage2_guarded":
+            return self._stage2_guarded_repair(
+                partial,
+                group_ids,
+                group_by_id,
+                yard_areas,
+            )
+        if op == "workload_balanced":
+            return self._workload_balanced_repair(
+                partial,
+                group_ids,
+                group_by_id,
+                yard_areas,
+            )
+        if op == "random":
+            return self._random_repair(
+                partial,
+                group_ids,
+                group_by_id,
+                yard_areas,
+            )
+        raise ValueError(f"未知 stage1_repair_operator: {op!r}")
+
     def _random_repair(
         self,
         partial: Stage1Solution,
@@ -932,6 +1492,286 @@ class Stage1YardAreaAssigner:
             partial.unassigned_group_ids.discard(group.group_id)
         return partial
 
+    def _workload_balanced_repair(
+        self,
+        partial: Stage1Solution,
+        group_ids: List[str],
+        group_by_id: Dict[str, AllocationGroup],
+        yard_areas: List[YardArea],
+    ) -> Stage1Solution:
+        if not group_ids:
+            return partial
+        if self.workload_snapshot is None:
+            return self._random_repair(partial, group_ids, group_by_id, yard_areas)
+
+        pending = [group_by_id[group_id] for group_id in group_ids if group_id in group_by_id]
+        if not pending:
+            return partial
+
+        regret_by_group: Dict[str, float] = {}
+        recompute_interval = max(1, int(self.config.repair_regret_recompute_interval))
+        processed_since_recompute = recompute_interval
+
+        while pending:
+            if processed_since_recompute >= recompute_interval or not regret_by_group:
+                regret_by_group = {
+                    group.group_id: self._estimate_repair_regret(
+                        partial,
+                        group,
+                        group_by_id,
+                        yard_areas,
+                    )
+                    for group in pending
+                }
+                processed_since_recompute = 0
+
+            selected_group = max(
+                pending,
+                key=lambda group: (
+                    regret_by_group.get(group.group_id, 0.0),
+                    self._rng.random(),
+                ),
+            )
+            regret = regret_by_group.get(selected_group.group_id, float("inf"))
+            context = self._replay_solution(partial, group_by_id, yard_areas)
+            base_cost = self.evaluate(partial, group_by_id, yard_areas)
+            candidate = self._try_assign_group(
+                partial,
+                selected_group,
+                group_by_id,
+                yard_areas,
+                repair_mode="workload_balanced",
+            )
+            if candidate is None:
+                partial.placements_by_group.pop(selected_group.group_id, None)
+                partial.unassigned_group_ids.add(selected_group.group_id)
+            else:
+                best_tie_score = self._workload_balanced_tie_score(
+                    candidate,
+                    selected_group,
+                    partial,
+                    context,
+                    group_by_id,
+                    yard_areas,
+                    base_cost,
+                )
+                partial.placements_by_group[selected_group.group_id] = candidate.placements
+                partial.unassigned_group_ids.discard(selected_group.group_id)
+                logger.debug(
+                    "Stage1 balanced repair: group=%s regret=%.3f tie_score=%.3f",
+                    selected_group.group_id,
+                    regret,
+                    best_tie_score,
+                )
+
+            pending = [
+                group for group in pending if group.group_id != selected_group.group_id
+            ]
+            regret_by_group.pop(selected_group.group_id, None)
+            processed_since_recompute += 1
+
+        return partial
+
+    def _stage2_guarded_repair(
+        self,
+        partial: Stage1Solution,
+        group_ids: List[str],
+        group_by_id: Dict[str, AllocationGroup],
+        yard_areas: List[YardArea],
+    ) -> Stage1Solution:
+        if not group_ids:
+            return partial
+        if self.workload_snapshot is None:
+            return self._random_repair(partial, group_ids, group_by_id, yard_areas)
+
+        pending = [group_by_id[group_id] for group_id in group_ids if group_id in group_by_id]
+        if not pending:
+            return partial
+
+        regret_by_group: Dict[str, float] = {}
+        recompute_interval = max(1, int(self.config.guard_regret_recompute_interval))
+        processed_since_recompute = recompute_interval
+
+        while pending:
+            if processed_since_recompute >= recompute_interval or not regret_by_group:
+                regret_by_group = {
+                    group.group_id: self._estimate_repair_regret(
+                        partial,
+                        group,
+                        group_by_id,
+                        yard_areas,
+                        repair_mode="stage2_guarded",
+                    )
+                    for group in pending
+                }
+                processed_since_recompute = 0
+
+            selected_group = max(
+                pending,
+                key=lambda group: (
+                    regret_by_group.get(group.group_id, 0.0),
+                    self._repair_group_difficulty(group),
+                    self._rng.random(),
+                ),
+            )
+            regret = regret_by_group.get(selected_group.group_id, float("inf"))
+            context = self._replay_solution(partial, group_by_id, yard_areas)
+            base_cost = self.evaluate(partial, group_by_id, yard_areas)
+            candidate = self._try_assign_group(
+                partial,
+                selected_group,
+                group_by_id,
+                yard_areas,
+                repair_mode="stage2_guarded",
+            )
+            if candidate is None:
+                partial.placements_by_group.pop(selected_group.group_id, None)
+                partial.unassigned_group_ids.add(selected_group.group_id)
+            else:
+                best_tie_score = self._stage2_guarded_tie_score(
+                    candidate,
+                    selected_group,
+                    partial,
+                    context,
+                    group_by_id,
+                    yard_areas,
+                    base_cost,
+                )
+                partial.placements_by_group[selected_group.group_id] = candidate.placements
+                partial.unassigned_group_ids.discard(selected_group.group_id)
+                logger.debug(
+                    "Stage1 guarded repair: group=%s regret=%.3f tie_score=%.3f",
+                    selected_group.group_id,
+                    regret,
+                    best_tie_score,
+                )
+
+            pending = [
+                group for group in pending if group.group_id != selected_group.group_id
+            ]
+            regret_by_group.pop(selected_group.group_id, None)
+            processed_since_recompute += 1
+
+        return partial
+
+    def _generate_repair_candidates(
+        self,
+        partial: Stage1Solution,
+        group: AllocationGroup,
+        group_by_id: Dict[str, AllocationGroup],
+        yard_areas: List[YardArea],
+        context: Stage1CostContext,
+        base_cost: float,
+        include_proactive_split: bool = True,
+    ) -> List[Stage1AssignmentCandidate]:
+        candidates = self._full_assignment_candidates(
+            partial,
+            group,
+            group_by_id,
+            yard_areas,
+            context,
+            base_cost,
+        )
+        if include_proactive_split:
+            candidates.extend(
+                self._proactive_split_candidates(
+                    partial,
+                    group,
+                    group_by_id,
+                    yard_areas,
+                    context,
+                    base_cost,
+                )
+            )
+        if not candidates:
+            split_candidate = self._repair_group_with_split(
+                partial,
+                group,
+                group_by_id,
+                yard_areas,
+                context,
+                base_cost,
+            )
+            if split_candidate is not None:
+                candidates.append(split_candidate)
+        return candidates
+
+    def _estimate_repair_regret(
+        self,
+        partial: Stage1Solution,
+        group: AllocationGroup,
+        group_by_id: Dict[str, AllocationGroup],
+        yard_areas: List[YardArea],
+        repair_mode: str = "workload_balanced",
+    ) -> float:
+        context = self._replay_solution(partial, group_by_id, yard_areas)
+        base_cost = self.evaluate(partial, group_by_id, yard_areas)
+        include_proactive_split = (
+            group.container_count > self._target_containers_per_area(group)
+            or group.column_demand >= self.config.large_group_column_threshold
+        )
+        candidates = self._full_assignment_candidates(
+            partial,
+            group,
+            group_by_id,
+            yard_areas,
+            context,
+            base_cost,
+        )
+        if include_proactive_split:
+            candidates.extend(
+                self._proactive_split_candidates(
+                    partial,
+                    group,
+                    group_by_id,
+                    yard_areas,
+                    context,
+                    base_cost,
+                )
+            )
+        if not candidates:
+            split_candidate = self._repair_group_with_split(
+                partial,
+                group,
+                group_by_id,
+                yard_areas,
+                context,
+                base_cost,
+            )
+            if split_candidate is not None:
+                candidates.append(split_candidate)
+        if not candidates:
+            return float("inf")
+        if repair_mode == "stage2_guarded":
+            guarded_candidates = self._filter_stage2_guarded_candidates(
+                candidates,
+                group,
+                partial,
+                context,
+                group_by_id,
+                yard_areas,
+                base_cost,
+            )
+            if guarded_candidates:
+                candidates = guarded_candidates
+
+        sort_scores = sorted(
+            self._repair_tie_score(
+                candidate,
+                group,
+                partial,
+                context,
+                group_by_id,
+                yard_areas,
+                base_cost,
+                repair_mode,
+            )
+            for candidate in candidates
+        )
+        if len(sort_scores) == 1:
+            return float("inf")
+        return sort_scores[1] - sort_scores[0]
+
     def _effective_split_weight(self, group: AllocationGroup) -> float:
         total_containers = max(1, group.container_count)
         target = self._target_containers_per_area(group)
@@ -950,10 +1790,11 @@ class Stage1YardAreaAssigner:
         group: AllocationGroup,
         group_by_id: Dict[str, AllocationGroup],
         yard_areas: List[YardArea],
+        repair_mode: str = "random",
     ) -> Optional[Stage1AssignmentCandidate]:
         context = self._replay_solution(partial, group_by_id, yard_areas)
         base_cost = self.evaluate(partial, group_by_id, yard_areas)
-        candidates = self._full_assignment_candidates(
+        candidates = self._generate_repair_candidates(
             partial,
             group,
             group_by_id,
@@ -961,27 +1802,6 @@ class Stage1YardAreaAssigner:
             context,
             base_cost,
         )
-        candidates.extend(
-            self._proactive_split_candidates(
-                partial,
-                group,
-                group_by_id,
-                yard_areas,
-                context,
-                base_cost,
-            )
-        )
-        if not candidates:
-            split_candidate = self._repair_group_with_split(
-                partial,
-                group,
-                group_by_id,
-                yard_areas,
-                context,
-                base_cost,
-            )
-            if split_candidate is not None:
-                candidates.append(split_candidate)
         if not candidates:
             return None
         required_areas = self._min_required_area_count(group)
@@ -994,7 +1814,16 @@ class Stage1YardAreaAssigner:
             ]
             if multi_area:
                 candidates = multi_area
-        return self._select_repair_candidate(candidates, group)
+        return self._select_repair_candidate(
+            candidates,
+            group,
+            repair_mode=repair_mode,
+            partial=partial,
+            context=context,
+            group_by_id=group_by_id,
+            yard_areas=yard_areas,
+            base_cost=base_cost,
+        )
 
     def _full_assignment_candidates(
         self,
@@ -1345,18 +2174,98 @@ class Stage1YardAreaAssigner:
         self,
         candidates: List[Stage1AssignmentCandidate],
         group: AllocationGroup,
+        *,
+        repair_mode: str = "random",
+        partial: Optional[Stage1Solution] = None,
+        context: Optional[Stage1CostContext] = None,
+        group_by_id: Optional[Dict[str, AllocationGroup]] = None,
+        yard_areas: Optional[List[YardArea]] = None,
+        base_cost: Optional[float] = None,
     ) -> Stage1AssignmentCandidate:
+        if repair_mode == "random":
+            candidates.sort(key=lambda candidate: self._candidate_sort_key(candidate, group))
+            if not self.config.repair_random_tie_break:
+                return candidates[0]
+            best_cost = candidates[0].delta_cost
+            top_k = max(1, min(self.config.repair_top_k, len(candidates)))
+            tied_candidates = [
+                candidate
+                for candidate in candidates[:top_k]
+                if candidate.delta_cost <= best_cost + self.config.repair_tie_tolerance
+            ]
+            return self._rng.choice(tied_candidates)
+
+        if repair_mode not in {"workload_balanced", "stage2_guarded"}:
+            raise ValueError(f"未知 repair_mode: {repair_mode!r}")
+        if (
+            partial is None
+            or context is None
+            or group_by_id is None
+            or yard_areas is None
+            or base_cost is None
+        ):
+            raise ValueError(f"{repair_mode} repair 需要完整的 partial/context/group_by_id/yard_areas/base_cost")
+
+        if repair_mode == "stage2_guarded":
+            filtered_candidates = self._filter_stage2_guarded_candidates(
+                candidates,
+                group,
+                partial,
+                context,
+                group_by_id,
+                yard_areas,
+                base_cost,
+            )
+            if filtered_candidates:
+                if len(filtered_candidates) < len(candidates):
+                    logger.debug(
+                        "Stage1 guarded repair filtered candidates: group=%s before=%s after=%s",
+                        group.group_id,
+                        len(candidates),
+                        len(filtered_candidates),
+                    )
+                candidates = filtered_candidates
+
         candidates.sort(key=lambda candidate: self._candidate_sort_key(candidate, group))
-        if not self.config.repair_random_tie_break:
-            return candidates[0]
-        best_cost = candidates[0].delta_cost
         top_k = max(1, min(self.config.repair_top_k, len(candidates)))
-        tied_candidates = [
+        best_cost = candidates[0].delta_cost
+        if repair_mode == "stage2_guarded":
+            tied_candidates = candidates
+        else:
+            tied_candidates = [
+                candidate
+                for candidate in candidates[:top_k]
+                if candidate.delta_cost <= best_cost + self.config.repair_tie_tolerance
+            ]
+        scored_candidates = sorted(
+            (
+                (
+                    self._repair_tie_score(
+                        candidate,
+                        group,
+                        partial,
+                        context,
+                        group_by_id,
+                        yard_areas,
+                        base_cost,
+                        repair_mode,
+                    ),
+                    self._candidate_sort_key(candidate, group),
+                    candidate,
+                )
+                for candidate in tied_candidates
+            ),
+            key=lambda item: (item[0], item[1]),
+        )
+        if not self.config.repair_random_tie_break:
+            return scored_candidates[0][2]
+        best_tie_score = scored_candidates[0][0]
+        final_candidates = [
             candidate
-            for candidate in candidates[:top_k]
-            if candidate.delta_cost <= best_cost + self.config.repair_tie_tolerance
+            for tie_score, _sort_key, candidate in scored_candidates
+            if tie_score <= best_tie_score + self.config.repair_tie_tolerance
         ]
-        return self._rng.choice(tied_candidates)
+        return self._rng.choice(final_candidates)
 
     def _candidate_sort_key(
         self,
@@ -1457,6 +2366,390 @@ class Stage1YardAreaAssigner:
             physical_cost=physical_cost,
             infeasible_count=infeasible_count,
         )
+
+    def _apply_preview_to_context(
+        self,
+        context: Stage1CostContext,
+        group: AllocationGroup,
+        placement: Stage1Placement,
+        preview: PlacementPreview,
+        n_containers: float,
+    ) -> None:
+        context.states[placement.area_id].apply_preview(preview)
+        context.area_load[placement.area_id] += placement.column_demand
+        context.line_area_load[(group.line_key, placement.area_id)] += placement.column_demand
+        context.physical_cost += preview.physical_cost
+        if n_containers <= 0:
+            return
+        step_ids = self._voyage_step_span_for_group(group)
+        if not step_ids:
+            return
+        per_step_containers = n_containers / len(step_ids)
+        inbound_delta, outbound_delta = self._placement_container_move_delta(
+            group,
+            per_step_containers,
+        )
+        for step_id in step_ids:
+            key = (placement.area_id, step_id)
+            current_inbound, current_outbound = context.workload_overlay.get(
+                key,
+                (0.0, 0.0),
+            )
+            context.workload_overlay[key] = (
+                current_inbound + inbound_delta,
+                current_outbound + outbound_delta,
+            )
+
+    def _area_congestion_stats(
+        self,
+        partial: Stage1Solution,
+        yard_areas: List[YardArea],
+        context: Stage1CostContext,
+    ) -> Tuple[Dict[str, int], Dict[str, float]]:
+        group_count_by_area: Dict[str, int] = defaultdict(int)
+        load_ratio_by_area: Dict[str, float] = {}
+        for placements in partial.placements_by_group.values():
+            for placement in placements:
+                group_count_by_area[placement.area_id] += 1
+        for area in yard_areas:
+            capacity = max(1, self._planning_capacity(area.area_id, context.states))
+            load_ratio_by_area[area.area_id] = (
+                context.area_load.get(area.area_id, 0) / capacity
+            )
+        return dict(group_count_by_area), load_ratio_by_area
+
+    def _workload_balanced_tie_score(
+        self,
+        candidate: Stage1AssignmentCandidate,
+        group: AllocationGroup,
+        partial: Stage1Solution,
+        context: Stage1CostContext,
+        group_by_id: Dict[str, AllocationGroup],
+        yard_areas: List[YardArea],
+        base_cost: float,
+    ) -> float:
+        del group_by_id, base_cost
+        temp_context = context.clone()
+        placement_container_counts = self._placement_container_counts(
+            group,
+            candidate.placements,
+        )
+        step_id = self._primary_target_step_id(group)
+        soft_target = self._workload_area_soft_target(group.business_type)
+        workload_penalty = 0.0
+        underload_reward = 0.0
+        physical_bias = 0.0
+
+        for placement, preview_entry, n_containers in zip(
+            candidate.placements,
+            candidate.previews,
+            placement_container_counts,
+        ):
+            _area_id, preview = preview_entry
+            if preview is None:
+                continue
+            self._apply_preview_to_context(
+                temp_context,
+                group,
+                placement,
+                preview,
+                n_containers,
+            )
+            workload = self._area_step_workload(
+                temp_context,
+                placement.area_id,
+                step_id,
+            )[2]
+            workload_penalty += max(0.0, workload - soft_target) ** 2
+            if workload < soft_target:
+                underload_reward += soft_target - workload
+            physical_bias += preview.physical_cost
+
+        group_count_by_area, load_ratio_by_area = self._area_congestion_stats(
+            partial,
+            yard_areas,
+            context,
+        )
+        congestion_penalty = 0.0
+        for placement in candidate.placements:
+            congestion_penalty += group_count_by_area.get(placement.area_id, 0)
+            congestion_penalty += (
+                self.config.repair_congestion_load_ratio
+                * load_ratio_by_area.get(placement.area_id, 0.0)
+            )
+
+        split_penalty = max(0, len(candidate.placements) - 1)
+        return (
+            candidate.delta_cost
+            + self.config.repair_workload_penalty_weight * workload_penalty
+            + self.config.repair_physical_bias_weight * physical_bias
+            + self.config.repair_congestion_weight * congestion_penalty
+            + self.config.repair_split_bias_weight * split_penalty
+            - self.config.repair_underload_reward_weight * underload_reward
+        )
+
+    def _repair_tie_score(
+        self,
+        candidate: Stage1AssignmentCandidate,
+        group: AllocationGroup,
+        partial: Stage1Solution,
+        context: Stage1CostContext,
+        group_by_id: Dict[str, AllocationGroup],
+        yard_areas: List[YardArea],
+        base_cost: float,
+        repair_mode: str,
+    ) -> float:
+        if repair_mode == "stage2_guarded":
+            return self._stage2_guarded_tie_score(
+                candidate,
+                group,
+                partial,
+                context,
+                group_by_id,
+                yard_areas,
+                base_cost,
+            )
+        return self._workload_balanced_tie_score(
+            candidate,
+            group,
+            partial,
+            context,
+            group_by_id,
+            yard_areas,
+            base_cost,
+        )
+
+    def _stage2_guarded_tie_score(
+        self,
+        candidate: Stage1AssignmentCandidate,
+        group: AllocationGroup,
+        partial: Stage1Solution,
+        context: Stage1CostContext,
+        group_by_id: Dict[str, AllocationGroup],
+        yard_areas: List[YardArea],
+        base_cost: float,
+    ) -> float:
+        del group_by_id, base_cost
+        affected_area_ids = {placement.area_id for placement in candidate.placements}
+        before_fragment = {
+            area_id: self._area_fragmentation_score(context.states[area_id])
+            for area_id in affected_area_ids
+        }
+        temp_context = self._context_after_candidate(context, group, candidate)
+        group_count_by_area = self._distinct_group_count_by_area(partial)
+        step_id = self._primary_target_step_id(group)
+        soft_target = self._workload_area_soft_target(group.business_type)
+
+        competition_penalty = 0.0
+        fragment_penalty = 0.0
+        headroom_penalty = 0.0
+        workload_penalty = 0.0
+        for area_id in affected_area_ids:
+            state_after = temp_context.states[area_id]
+            n_groups_after = group_count_by_area.get(area_id, 0) + 1
+            n_segments = self._stage2_proxy_segment_count(state_after, group)
+            competition_penalty += n_groups_after / max(1, n_segments)
+            fragment_penalty += max(
+                0.0,
+                self._area_fragmentation_score(state_after)
+                - before_fragment.get(area_id, 0.0),
+            )
+            workload = self._area_step_workload(temp_context, area_id, step_id)[2]
+            workload_penalty += max(0.0, workload - soft_target) ** 2
+
+        for placement in candidate.placements:
+            state_after = temp_context.states[placement.area_id]
+            headroom = self._stage2_proxy_headroom(state_after, group)
+            demand = max(1, placement.column_demand)
+            shortage = max(0.0, demand - headroom)
+            if placement.column_demand >= self.config.guard_large_group_column_threshold:
+                shortage *= 1.0 + shortage / demand
+            headroom_penalty += shortage
+
+        split_penalty = max(0, len(candidate.placements) - 1)
+        return (
+            candidate.delta_cost
+            + self.config.guard_competition_weight * competition_penalty
+            + self.config.guard_fragment_weight * fragment_penalty
+            + self.config.guard_headroom_weight * headroom_penalty
+            + self.config.guard_workload_penalty_weight * workload_penalty
+            + self.config.guard_split_weight * split_penalty
+        )
+
+    def _filter_stage2_guarded_candidates(
+        self,
+        candidates: List[Stage1AssignmentCandidate],
+        group: AllocationGroup,
+        partial: Stage1Solution,
+        context: Stage1CostContext,
+        group_by_id: Dict[str, AllocationGroup],
+        yard_areas: List[YardArea],
+        base_cost: float,
+    ) -> List[Stage1AssignmentCandidate]:
+        del group_by_id, yard_areas, base_cost
+        group_count_by_area = self._distinct_group_count_by_area(partial)
+        filtered: List[Stage1AssignmentCandidate] = []
+        for candidate in candidates:
+            temp_context = self._context_after_candidate(context, group, candidate)
+            if self._stage2_guarded_candidate_passes(
+                candidate,
+                group,
+                temp_context,
+                group_count_by_area,
+            ):
+                filtered.append(candidate)
+        return filtered
+
+    def _stage2_guarded_candidate_passes(
+        self,
+        candidate: Stage1AssignmentCandidate,
+        group: AllocationGroup,
+        context_after: Stage1CostContext,
+        group_count_by_area: Dict[str, int],
+    ) -> bool:
+        affected_area_ids = {placement.area_id for placement in candidate.placements}
+        for area_id in affected_area_ids:
+            state_after = context_after.states[area_id]
+            n_groups_after = group_count_by_area.get(area_id, 0) + 1
+            n_segments = self._stage2_proxy_segment_count(state_after, group)
+            competition = n_groups_after / max(1, n_segments)
+            if competition > self.config.guard_max_competition_ratio:
+                return False
+
+        for placement in candidate.placements:
+            if placement.column_demand < self.config.guard_large_group_column_threshold:
+                continue
+            headroom = self._stage2_proxy_headroom(
+                context_after.states[placement.area_id],
+                group,
+            )
+            if headroom < self.config.guard_min_headroom_ratio * placement.column_demand:
+                return False
+        return True
+
+    def _context_after_candidate(
+        self,
+        context: Stage1CostContext,
+        group: AllocationGroup,
+        candidate: Stage1AssignmentCandidate,
+    ) -> Stage1CostContext:
+        temp_context = context.clone()
+        placement_container_counts = self._placement_container_counts(
+            group,
+            candidate.placements,
+        )
+        for placement, preview_entry, n_containers in zip(
+            candidate.placements,
+            candidate.previews,
+            placement_container_counts,
+        ):
+            _area_id, preview = preview_entry
+            self._apply_preview_to_context(
+                temp_context,
+                group,
+                placement,
+                preview,
+                n_containers,
+            )
+        return temp_context
+
+    @staticmethod
+    def _distinct_group_count_by_area(partial: Stage1Solution) -> Dict[str, int]:
+        group_ids_by_area: Dict[str, Set[str]] = defaultdict(set)
+        for group_id, placements in partial.placements_by_group.items():
+            for placement in placements:
+                group_ids_by_area[placement.area_id].add(group_id)
+        return {
+            area_id: len(group_ids)
+            for area_id, group_ids in group_ids_by_area.items()
+        }
+
+    def _stage2_proxy_segment_count(
+        self,
+        state: AreaResourceState,
+        group: AllocationGroup,
+    ) -> int:
+        if group.size == ContainerSize.SIZE_20:
+            return sum(
+                1
+                for bay_number, free_columns in state.bay_free.items()
+                if free_columns > 0 and state._can_use_bay_for_20ft(bay_number)
+            )
+        return sum(
+            1
+            for bay_a, bay_b, is_edge in state.pair_bays
+            if (group.size != ContainerSize.SIZE_45 or is_edge)
+            and state._can_use_pair_for_large(bay_a, bay_b)
+            and min(state.bay_free.get(bay_a, 0), state.bay_free.get(bay_b, 0)) > 0
+        )
+
+    def _stage2_proxy_headroom(
+        self,
+        state: AreaResourceState,
+        group: AllocationGroup,
+    ) -> int:
+        if group.size == ContainerSize.SIZE_20:
+            return self._contiguous_20ft_headroom(state)
+        return self._contiguous_large_headroom(
+            state,
+            edge_only=group.size == ContainerSize.SIZE_45,
+        )
+
+    @staticmethod
+    def _contiguous_20ft_headroom(state: AreaResourceState) -> int:
+        best = 0
+        current = 0
+        previous_bay: Optional[int] = None
+        for bay_number in sorted(state.bay_free):
+            free_columns = state.bay_free.get(bay_number, 0)
+            if free_columns <= 0 or not state._can_use_bay_for_20ft(bay_number):
+                current = 0
+                previous_bay = None
+                continue
+            if previous_bay is None or bay_number == previous_bay + 1:
+                current += free_columns
+            else:
+                current = free_columns
+            best = max(best, current)
+            previous_bay = bay_number
+        return best
+
+    @staticmethod
+    def _contiguous_large_headroom(
+        state: AreaResourceState,
+        edge_only: bool,
+    ) -> int:
+        best = 0
+        current = 0
+        previous_pair: Optional[Tuple[int, int]] = None
+        for bay_a, bay_b, is_edge in sorted(state.pair_bays):
+            if edge_only and not is_edge:
+                current = 0
+                previous_pair = None
+                continue
+            free_columns = min(state.bay_free.get(bay_a, 0), state.bay_free.get(bay_b, 0))
+            if free_columns <= 0 or not state._can_use_pair_for_large(bay_a, bay_b):
+                current = 0
+                previous_pair = None
+                continue
+            if previous_pair is None or bay_a <= previous_pair[1] + 1:
+                current += free_columns
+            else:
+                current = free_columns
+            best = max(best, current)
+            previous_pair = (bay_a, bay_b)
+        return best
+
+    @staticmethod
+    def _repair_group_difficulty(group: AllocationGroup) -> float:
+        if group.size == ContainerSize.SIZE_45:
+            size_difficulty = 300.0 if group.is_edge_only else 250.0
+        elif group.size == ContainerSize.SIZE_40:
+            size_difficulty = 200.0
+        else:
+            size_difficulty = 100.0
+        split_difficulty = 25.0 if group.is_split else 0.0
+        return size_difficulty + group.column_demand + split_difficulty
 
     def _placement_container_counts(
         self,

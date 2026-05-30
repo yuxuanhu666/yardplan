@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from yardplan_core.integrations import TOSLoader
 from yardplan_core.models import (
@@ -32,7 +32,13 @@ def _normalize_plan_window(
     return plan_start_time, plan_end_time
 
 
+def _range_plan_data(result: PlanningResult) -> List[Dict[str, Any]]:
+    return result.metrics.get("range_plan", {}).get("data", [])
+
+
 def run_plan(
+    token: Optional[str] = None,
+    *,
     line_keys: List[int],
     type: int = 1,
     apply_to_yard: bool = False,
@@ -42,9 +48,15 @@ def run_plan(
     visualization_use_real_coordinates: bool = True,
     plan_start_time: Optional[datetime] = None,
     plan_end_time: Optional[datetime] = None,
-) -> PlanningResult:
+    return_list: bool = False,
+) -> Union[PlanningResult, List[Dict[str, Any]]]:
     """
     规划入口：传入一个或多个航线号，完成进出口箱堆场分配规划。
+
+    token: 第一个参数，TOS/平台访问令牌（str），默认 None；不传时由调用方（如 FastAPI）决定是否回退到服务注册 token。
+    line_keys: 航线号列表（keyword-only）。
+    return_list: 为 True 时直接返回 API 用的分配组列表（等同 metrics["range_plan"]["data"]）；
+        为 False 时返回完整 PlanningResult（本地调试、可视化用）。
 
     plan_start_time / plan_end_time: 手动规划范围；仅纳入与该区间有交集的航次，
     滚动时间步亦使用该区间。二者须同时指定或同时省略。
@@ -57,7 +69,7 @@ def run_plan(
         plan_start_time, plan_end_time
     )
 
-    loader = TOSLoader()
+    loader = TOSLoader(token=token)
     normalized_line_keys: List[int] = []
     for raw_key in line_keys:
         line_key = loader._coerce_line_key(raw_key)
@@ -165,7 +177,7 @@ def run_plan(
             horizon_end=horizon_end,
         )
 
-    range_items = result.metrics.get("range_plan", {}).get("data", [])
+    range_items = _range_plan_data(result)
     if range_items:
         print(f"\n  分配组范围结果 ({len(range_items)} 个分配组):")
         for item in range_items[:20]:
@@ -198,6 +210,8 @@ def run_plan(
             logger.warning("生成可视化失败: %s", exc)
             print(f"\n  可视化生成失败: {exc}")
 
+    if return_list:
+        return range_items
     return result
 
 

@@ -390,7 +390,9 @@ class TOSLoader:
         self,
         vessel_visit_path: Optional[str] = None,
         bound_list_path: Optional[str] = None,
+        token: Optional[str] = None,
     ):
+        self.token = token
         self.vessel_visit_path = vessel_visit_path or os.path.join(
             _DATA_DIR,
             "217getVesselVisit（船舶访问计划）.json",
