@@ -39,7 +39,8 @@ def _range_plan_data(result: PlanningResult) -> List[Dict[str, Any]]:
 def run_plan(
     token: Optional[str] = None,
     *,
-    line_keys: List[int],
+    line_keys: Optional[List[int]] = None,
+    vessel_key: Optional[int] = None,
     type: int = 1,
     apply_to_yard: bool = False,
     save_visualization: bool = False,
@@ -71,20 +72,34 @@ def run_plan(
 
     loader = TOSLoader(token=token)
     normalized_line_keys: List[int] = []
-    for raw_key in line_keys:
+    for raw_key in line_keys or []:
         line_key = loader._coerce_line_key(raw_key)
         if line_key is None:
             raise ValueError(f"无效的 lineKey: {raw_key!r}")
         normalized_line_keys.append(line_key)
 
+    normalized_vessel_key = loader._coerce_line_key(vessel_key)
+    if vessel_key is not None and normalized_vessel_key is None:
+        raise ValueError(f"Invalid vesselKey: {vessel_key!r}")
+
+    has_line_keys = len(normalized_line_keys) > 0
+    has_vessel_key = normalized_vessel_key is not None
+    if has_line_keys == has_vessel_key:
+        raise ValueError("Provide exactly one of line_keys or vessel_key")
+    if has_vessel_key and type != 1:
+        raise ValueError("vessel_key mode currently supports type=1 only")
+
     print("=" * 70)
+    if has_vessel_key:
+        print(f"  vesselKey: {normalized_vessel_key}")
     print(f"  堆场规划  type={type}  lineKeys: {normalized_line_keys}")
     if plan_start_time is not None and plan_end_time is not None:
         print(f"  规划范围: {plan_start_time} → {plan_end_time}")
     print("=" * 70)
 
     vessels = loader.load_vessels(
-        normalized_line_keys,
+        line_keys=normalized_line_keys,
+        vessel_key=normalized_vessel_key,
         plan_start_time=plan_start_time,
         plan_end_time=plan_end_time,
     )
@@ -107,12 +122,14 @@ def run_plan(
 
     if type == 1:
         import_containers = loader.load_discharge_containers(
-            normalized_line_keys,
-            vessels,
+            line_keys=normalized_line_keys,
+            vessel_key=normalized_vessel_key,
+            vessels=vessels,
         )
         export_containers = loader.load_loading_containers(
-            normalized_line_keys,
-            vessels,
+            line_keys=normalized_line_keys,
+            vessel_key=normalized_vessel_key,
+            vessels=vessels,
         )
         containers = import_containers + export_containers
         if not containers:
@@ -121,6 +138,18 @@ def run_plan(
                 run_id="PLAN-EMPTY",
                 timestamp=datetime.now(),
                 mode=PlannerMode.FULL_PLAN,
+            )
+        if has_vessel_key:
+            container_visit_ids = {container.voyage_id for container in containers}
+            vessels = {
+                visit_id: vessel
+                for visit_id, vessel in vessels.items()
+                if visit_id in container_visit_ids
+            }
+            horizon_start, horizon_end = loader.build_planning_horizon(
+                vessels,
+                plan_start_time=plan_start_time,
+                plan_end_time=plan_end_time,
             )
     else:
         external_groups = loader.load_external_allocation_groups(
@@ -192,6 +221,9 @@ def run_plan(
 
     if save_visualization:
         output_path = visualization_path or _default_visualization_path(result.run_id)
+        output_dir = os.path.dirname(os.path.abspath(output_path))
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
         config = YardVisualizationConfig(
             prefer_real_coordinates=visualization_use_real_coordinates
         )
@@ -205,6 +237,7 @@ def run_plan(
                 else None,
                 config=config,
             )
+            result.metrics["visualization_path"] = output_path
             print(f"\n  可视化结果已保存: {output_path}")
         except Exception as exc:
             logger.warning("生成可视化失败: %s", exc)

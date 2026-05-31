@@ -190,19 +190,25 @@ class Stage2PlacementOption:
 
 @dataclass
 class Stage2ScipConfig:
-    time_limit_seconds: float = 20.0
+    time_limit_seconds: float = 60.0
     unmet_weight: float = 1_000_000.0
     segment_weight: float = 1_000.0
-    region_component_weight: float = 250.0
-    enforce_stack_contiguity: bool = True
+    region_component_weight: float = 1_500.0
+    # These layout-shape rules are useful for prettier blocks, but making them
+    # hard by default can leave boxes unmet even when physical slots exist.
+    enforce_stack_contiguity: bool = False
     segment_min_fill_ratio: float = 0.65
     max_underfilled_segments_per_item: int = 2
     # Crane balance should only be a weak tie-breaker; it must not tear apart
     # a physically feasible contiguous parent-group block.
     crane_balance_weight: float = 1.0
     stability_weight: float = 0.001
-    enforce_bay_run_contiguity: bool = True
-    enforce_sequential_segment_fill: bool = True
+    enforce_bay_run_contiguity: bool = False
+    enforce_sequential_segment_fill: bool = False
+    enforce_segment_min_fill: bool = False
+    stack_run_weight: float = 600.0
+    isolated_cell_weight: float = 800.0
+    soft_geometric_region_axis: bool = True
 
 
 class ScipStage2BayAllocator:
@@ -341,7 +347,15 @@ class ScipStage2BayAllocator:
             placed_expr[item_key] = placed
             model.addCons(placed + unmet[item_key] == demand, name=f"demand_{item_key}")
 
-        if self.config.enforce_bay_run_contiguity or self.config.enforce_sequential_segment_fill:
+        needs_geometric_axis = (
+            self.config.enforce_bay_run_contiguity
+            or self.config.enforce_sequential_segment_fill
+            or (
+                self.config.soft_geometric_region_axis
+                and self.config.region_component_weight > 0
+            )
+        )
+        if needs_geometric_axis:
             self._inject_geometric_segment_axis(
                 model,
                 area,
@@ -352,15 +366,40 @@ class ScipStage2BayAllocator:
             )
 
         region_start_terms: List[Any] = []
+        stack_run_terms: List[Any] = []
+        isolated_cell_terms: List[Any] = []
         if self.config.enforce_stack_contiguity:
             self._add_stack_contiguity_constraints(model, segment_stack_vars)
-        self._add_segment_fill_constraints(
-            model,
-            segment_stack_vars,
-            item_segments,
-            item_keys,
-            region_start_terms,
-        )
+        if self.config.enforce_segment_min_fill:
+            self._add_segment_fill_constraints(
+                model,
+                segment_stack_vars,
+                item_segments,
+                item_keys,
+                region_start_terms,
+            )
+        else:
+            self._add_region_start_constraints(
+                model,
+                item_segments,
+                item_keys,
+                region_start_terms,
+            )
+        if self.config.stack_run_weight > 0:
+            self._add_soft_stack_run_constraints(
+                model,
+                segment_stack_vars,
+                item_segments,
+                stack_run_terms,
+            )
+        if self.config.isolated_cell_weight > 0:
+            self._add_soft_isolated_cell_constraints(
+                model,
+                segment_stack_vars,
+                item_segments,
+                item_keys,
+                isolated_cell_terms,
+            )
         self._add_segment_activation_constraints(
             model,
             segment_stack_vars,
@@ -423,6 +462,8 @@ class ScipStage2BayAllocator:
             self.config.unmet_weight * quicksum(unmet.values())
             + self.config.segment_weight * quicksum(y.values())
             + self.config.region_component_weight * quicksum(region_start_terms)
+            + self.config.stack_run_weight * quicksum(stack_run_terms)
+            + self.config.isolated_cell_weight * quicksum(isolated_cell_terms)
             + self.config.crane_balance_weight * balance
             + self.config.stability_weight * quicksum(stability_terms)
         )
@@ -492,6 +533,151 @@ class ScipStage2BayAllocator:
                             ),
                         )
 
+    def _add_soft_stack_run_constraints(
+        self,
+        model: Any,
+        segment_stack_vars: Dict[Tuple[str, BaySpec], Dict[int, Any]],
+        item_segments: Dict[str, Dict[BaySpec, Any]],
+        stack_run_terms: List[Any],
+    ) -> None:
+        """
+        Penalize extra stack runs inside one bay/large-bay segment.
+
+        A single contiguous stack interval has zero extra-run cost. Split shapes
+        like stack 1 + stack 5 pay a soft penalty, so they remain allowed when
+        needed for feasibility but are avoided when compact slots exist.
+        """
+        for (item_key, segment), stack_vars in segment_stack_vars.items():
+            stacks = sorted(int(stack) for stack in stack_vars)
+            if len(stacks) <= 1:
+                continue
+
+            segment_var = item_segments.get(item_key, {}).get(segment)
+            if segment_var is None:
+                continue
+
+            segment_name = self._segment_name(segment)
+            start_terms: List[Any] = []
+            previous_stack: Optional[int] = None
+            previous_var: Optional[Any] = None
+            for stack in stacks:
+                stack_var = stack_vars[stack]
+                start_var = model.addVar(
+                    vtype="B",
+                    name=f"stack_run_start_{item_key}_{segment_name}_{stack}",
+                )
+                if previous_stack is None or previous_var is None or stack != previous_stack + 1:
+                    model.addCons(
+                        start_var >= stack_var,
+                        name=f"stack_run_first_{item_key}_{segment_name}_{stack}",
+                    )
+                else:
+                    model.addCons(
+                        start_var >= stack_var - previous_var,
+                        name=f"stack_run_link_{item_key}_{segment_name}_{stack}",
+                    )
+                model.addCons(
+                    start_var <= stack_var,
+                    name=f"stack_run_active_{item_key}_{segment_name}_{stack}",
+                )
+                start_terms.append(start_var)
+                previous_stack = stack
+                previous_var = stack_var
+
+            extra_runs = model.addVar(
+                vtype="C",
+                lb=0,
+                ub=max(0, len(stacks) - 1),
+                name=f"stack_extra_runs_{item_key}_{segment_name}",
+            )
+            model.addCons(
+                extra_runs >= sum(start_terms) - segment_var,
+                name=f"stack_extra_run_count_{item_key}_{segment_name}",
+            )
+            stack_run_terms.append(extra_runs)
+
+    def _add_soft_isolated_cell_constraints(
+        self,
+        model: Any,
+        segment_stack_vars: Dict[Tuple[str, BaySpec], Dict[int, Any]],
+        item_segments: Dict[str, Dict[BaySpec, Any]],
+        item_keys: List[str],
+        isolated_cell_terms: List[Any],
+    ) -> None:
+        """
+        Penalize selected cells that have no same-group neighbor.
+
+        Neighbor means either adjacent stack in the same bay/large-bay segment,
+        or the same stack position in the previous/next geometric bay segment.
+        This is a soft clustering preference, not a feasibility rule.
+        """
+        per_item: Dict[str, Dict[BaySpec, Dict[int, Any]]] = defaultdict(dict)
+        for (item_key, segment), stack_vars in segment_stack_vars.items():
+            per_item[item_key][segment] = stack_vars
+
+        for item_key in item_keys:
+            segments = per_item.get(item_key, {})
+            if not segments:
+                continue
+
+            ordered_segments = self._ordered_item_segments(item_segments, item_key)
+            segment_position = {
+                segment: index
+                for index, segment in enumerate(ordered_segments)
+            }
+
+            for segment, stack_vars in segments.items():
+                segment_name = self._segment_name(segment)
+                position = segment_position.get(segment)
+                previous_segment = (
+                    ordered_segments[position - 1]
+                    if position is not None and position > 0
+                    else None
+                )
+                next_segment = (
+                    ordered_segments[position + 1]
+                    if position is not None and position + 1 < len(ordered_segments)
+                    else None
+                )
+
+                for stack, stack_var in stack_vars.items():
+                    stack_index = int(stack)
+                    neighbors: List[Any] = []
+                    for adjacent_stack in (stack_index - 1, stack_index + 1):
+                        neighbor = stack_vars.get(adjacent_stack)
+                        if neighbor is not None:
+                            neighbors.append(neighbor)
+                    if previous_segment is not None:
+                        neighbor = segments.get(previous_segment, {}).get(stack_index)
+                        if neighbor is not None:
+                            neighbors.append(neighbor)
+                    if next_segment is not None:
+                        neighbor = segments.get(next_segment, {}).get(stack_index)
+                        if neighbor is not None:
+                            neighbors.append(neighbor)
+
+                    isolated = model.addVar(
+                        vtype="C",
+                        lb=0,
+                        ub=1,
+                        name=f"isolated_cell_{item_key}_{segment_name}_{stack_index}",
+                    )
+                    if neighbors:
+                        model.addCons(
+                            isolated >= stack_var - sum(neighbors),
+                            name=f"isolated_cell_link_{item_key}_{segment_name}_{stack_index}",
+                        )
+                    else:
+                        model.addCons(
+                            isolated >= stack_var,
+                            name=f"isolated_cell_no_neighbor_{item_key}_{segment_name}_{stack_index}",
+                        )
+                    model.addCons(
+                        isolated <= stack_var,
+                        name=f"isolated_cell_active_{item_key}_{segment_name}_{stack_index}",
+                    )
+                    isolated_cell_terms.append(isolated)
+
     def _add_segment_fill_constraints(
         self,
         model: Any,
@@ -544,26 +730,52 @@ class ScipStage2BayAllocator:
                     name=f"underfill_limit_{item_key}",
                 )
 
+        self._add_region_start_constraints(
+            model,
+            item_segments,
+            item_keys,
+            region_start_terms,
+        )
+
+    def _add_region_start_constraints(
+        self,
+        model: Any,
+        item_segments: Dict[str, Dict[BaySpec, Any]],
+        item_keys: List[str],
+        region_start_terms: List[Any],
+    ) -> None:
+        """
+        Add soft bay-axis fragmentation counters.
+
+        These variables are only used in the objective, so they prefer compact
+        blocks without preventing use of otherwise valid physical slots.
+        """
+        for item_key in item_keys:
+            segments = item_segments.get(item_key, {})
+            if not segments:
+                continue
+
             previous_segment_var: Optional[Any] = None
             for segment in sorted(segments, key=self._bay_spec_sort_key):
                 segment_var = segments[segment]
+                segment_name = self._segment_name(segment)
                 start_var = model.addVar(
                     vtype="B",
-                    name=f"region_start_{item_key}_{self._segment_name(segment)}",
+                    name=f"region_start_{item_key}_{segment_name}",
                 )
                 if previous_segment_var is None:
                     model.addCons(
                         start_var >= segment_var,
-                        name=f"region_first_start_{item_key}_{self._segment_name(segment)}",
+                        name=f"region_first_start_{item_key}_{segment_name}",
                     )
                 else:
                     model.addCons(
                         start_var >= segment_var - previous_segment_var,
-                        name=f"region_start_link_{item_key}_{self._segment_name(segment)}",
+                        name=f"region_start_link_{item_key}_{segment_name}",
                     )
                 model.addCons(
                     start_var <= segment_var,
-                    name=f"region_start_active_{item_key}_{self._segment_name(segment)}",
+                    name=f"region_start_active_{item_key}_{segment_name}",
                 )
                 region_start_terms.append(start_var)
                 previous_segment_var = segment_var

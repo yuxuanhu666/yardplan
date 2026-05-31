@@ -493,7 +493,7 @@ class Stage1LNSConfig:
 
     max_split_parts: int = 4
     large_group_column_threshold: int = 4
-    max_iterations: int = 80
+    max_iterations: int = 120
     no_improve_limit: int = 20
     destroy_fraction: float = 0.2
     hotspot_area_count: int = 3
@@ -504,7 +504,7 @@ class Stage1LNSConfig:
     time_limit_seconds: Optional[float] = None
     workload_provider: Optional[str] = "simulated"
     workload_soft_capacity_ratio: float = 0.85
-    workload_balance_weight: float = 20.0
+    workload_balance_weight: float = 13.0
     workload_use_target_eta_step_only: bool = True
     workload_non_target_step_weight: float = 0.0
     line_small_fragment_weight: float = 5.0
@@ -519,11 +519,11 @@ class Stage1LNSConfig:
     base_split_weight: float = 6.0
     workload_area_soft_target_export: float = 80.0
     workload_area_soft_target_import: float = 120.0
-    workload_overload_weight: float = 18.0
+    workload_overload_weight: float = 15.0
     workload_spread_weight_scale: float = 0.15
-    physical_weight: float = 7.0
-    unassigned_weight: float = 100000.0
-    line_max_area_share_threshold: float = 0.40
+    physical_weight: float = 10.0
+    unassigned_weight: float = 10000.0
+    line_max_area_share_threshold: float = 0.45
     line_share_penalty_weight: float = 24.0
     line_share_penalty_power: float = 2.0
     line_min_total_for_share_penalty: int = 8
