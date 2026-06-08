@@ -404,7 +404,7 @@ class TOSLoader:
 
     def load_vessels(
         self,
-        line_keys: Optional[List[int]] = None,
+        line_keys: Optional[int] = None,
         vessel_key: Optional[int] = None,
         plan_start_time: Optional[datetime] = None,
         plan_end_time: Optional[datetime] = None,
@@ -412,25 +412,21 @@ class TOSLoader:
         with open(self.vessel_visit_path, "r", encoding="utf-8") as file:
             raw: List[dict] = json.load(file)
 
-        target_set = {
-            line_key
-            for line_key in (self._coerce_line_key(value) for value in line_keys or [])
-            if line_key is not None
-        }
-        target_vessel_key = self._coerce_line_key(vessel_key)
+        target_set = self._coerce_line_key_set(line_keys)
+        target_visit_dbkeys = self._coerce_line_key_set(vessel_key)
         vessels: Dict[str, Vessel] = {}
         matched_line_keys: Set[int] = set()
-        matched_vessel_key = False
+        matched_visit_dbkeys: Set[int] = set()
         skipped_by_plan_window = 0
 
         for item in raw:
             vessel_visit_id = item.get("vesselVisitId", "")
             line_key = self._coerce_line_key(item.get("lineKey"))
-            item_vessel_key = self._coerce_line_key(item.get("vesselKey"))
-            if target_vessel_key is not None:
-                if item_vessel_key != target_vessel_key:
+            item_visit_dbkey = self._coerce_line_key(item.get("dbkey"))
+            if target_visit_dbkeys:
+                if item_visit_dbkey is None or item_visit_dbkey not in target_visit_dbkeys:
                     continue
-                matched_vessel_key = True
+                matched_visit_dbkeys.add(item_visit_dbkey)
             else:
                 if line_key not in target_set:
                     continue
@@ -461,26 +457,32 @@ class TOSLoader:
         missing = target_set - matched_line_keys
         if missing:
             logger.warning(f"TOSLoader: VesselVisit 中未找到航线号: {sorted(missing)}")
-        if target_vessel_key is not None and not matched_vessel_key:
+        missing_visit_dbkeys = target_visit_dbkeys - matched_visit_dbkeys
+        if missing_visit_dbkeys:
             logger.warning(
-                f"TOSLoader: VesselVisit did not match vesselKey {target_vessel_key}"
+                f"TOSLoader: VesselVisit did not match dbkeys {sorted(missing_visit_dbkeys)}"
             )
+        target_description = (
+            f"visitDbkeys: {sorted(target_visit_dbkeys)}"
+            if target_visit_dbkeys
+            else f"lineKeys: {sorted(target_set)}"
+        )
         if plan_start_time is not None and plan_end_time is not None:
             logger.info(
                 f"TOSLoader: 规划范围 {plan_start_time} → {plan_end_time}，"
                 f"加载船舶 {len(vessels)} 艘"
-                f" (lineKeys: {sorted(target_set)}，范围外跳过 {skipped_by_plan_window} 艘)"
+                f" ({target_description}，范围外跳过 {skipped_by_plan_window} 艘)"
             )
         else:
             logger.info(
                 f"TOSLoader: 加载船舶 {len(vessels)} 艘"
-                f" (lineKeys: {sorted(target_set)})"
+                f" ({target_description})"
             )
         return vessels
 
     def load_discharge_containers(
         self,
-        line_keys: Optional[List[int]],
+        line_keys: Optional[int],
         vessels: Dict[str, Vessel],
         vessel_key: Optional[int] = None,
     ) -> List[Container]:
@@ -497,7 +499,7 @@ class TOSLoader:
 
     def load_loading_containers(
         self,
-        line_keys: Optional[List[int]],
+        line_keys: Optional[int],
         vessels: Dict[str, Vessel],
         vessel_key: Optional[int] = None,
     ) -> List[Container]:
@@ -515,7 +517,7 @@ class TOSLoader:
 
     def _load_bound_containers(
         self,
-        line_keys: Optional[List[int]],
+        line_keys: Optional[int],
         vessels: Dict[str, Vessel],
         vessel_key: Optional[int] = None,
         *,
@@ -529,12 +531,8 @@ class TOSLoader:
             raw: dict = json.load(file)
 
         entries: List[dict] = raw.get(section_name, [])
-        target_set = {
-            line_key
-            for line_key in (self._coerce_line_key(value) for value in line_keys or [])
-            if line_key is not None
-        }
-        target_vessel_key = self._coerce_line_key(vessel_key)
+        target_set = self._coerce_line_key_set(line_keys)
+        target_visit_dbkeys = self._coerce_line_key_set(vessel_key)
         containers: List[Container] = []
 
         for item in entries:
@@ -545,7 +543,7 @@ class TOSLoader:
             service_line_key = self._coerce_line_key(
                 container_raw.get("serviceLineKey")
             )
-            if target_vessel_key is None and service_line_key not in target_set:
+            if not target_visit_dbkeys and service_line_key not in target_set:
                 continue
 
             dto = item.get("boundListDTO") or {}
@@ -617,30 +615,31 @@ class TOSLoader:
                 )
             )
 
+        target_description = (
+            f"visitDbkeys: {sorted(target_visit_dbkeys)}"
+            if target_visit_dbkeys
+            else f"lineKeys: {sorted(target_set)}"
+        )
         logger.info(
             f"TOSLoader: 加载{description} {len(containers)} 个"
-            f" (lineKeys: {sorted(target_set)})"
+            f" ({target_description})"
         )
-        if target_vessel_key is not None:
+        if target_visit_dbkeys:
             logger.info(
                 f"TOSLoader: loaded {description} {len(containers)} containers "
-                f"(vesselKey: {target_vessel_key})"
+                f"(visitDbkeys: {sorted(target_visit_dbkeys)})"
             )
         return containers
 
     def load_external_allocation_groups(
         self,
-        line_keys: List[int],
+        line_keys: int,
         vessels: Dict[str, Vessel],
     ) -> List[AllocationGroup]:
-        normalized_line_keys = [
-            line_key
-            for line_key in (self._coerce_line_key(value) for value in line_keys)
-            if line_key is not None
-        ]
+        normalized_line_key = self._coerce_line_key(line_keys)
         raise NotImplementedError(
             "type=2 需要从外部分配组接口读取数据；接口未提供，"
-            f"已预留 load_external_allocation_groups(line_keys={normalized_line_keys})"
+            f"已预留 load_external_allocation_groups(line_keys={normalized_line_key})"
         )
 
     def build_planning_horizon(
@@ -700,6 +699,22 @@ class TOSLoader:
                 continue
         logger.warning(f"TOSLoader: 无法解析时间字符串: {dt_str!r}")
         return None
+
+    @classmethod
+    def _coerce_line_key_set(cls, raw_values: Any) -> Set[int]:
+        if raw_values is None:
+            return set()
+
+        values = (
+            raw_values
+            if isinstance(raw_values, (list, tuple, set))
+            else [raw_values]
+        )
+        return {
+            line_key
+            for line_key in (cls._coerce_line_key(value) for value in values)
+            if line_key is not None
+        }
 
     @staticmethod
     def _coerce_line_key(raw_value: Any) -> Optional[int]:

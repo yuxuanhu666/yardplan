@@ -131,15 +131,14 @@ if __name__ == "__main__":
     target.add_argument(
         "--line-key",
         dest="line_keys",
-        action="append",
         type=int,
-        help="Line key. Repeat it to pass more than one line key.",
+        help="Service line key.",
     )
     target.add_argument(
         "--vessel-key",
         dest="vessel_key",
         type=int,
-        help="Vessel key. With type=1, only containers for this vessel key are grouped.",
+        help="VesselVisit dbkey.",
     )
     parser.add_argument("--type", dest="plan_type", type=int, default=1)
     parser.add_argument("--start", type=str, help="Plan start time, e.g. 2025-12-21T00:00:00")
@@ -175,13 +174,15 @@ if __name__ == "__main__":
             visualization_path=args.visualization_path,
             plan_start_time=plan_start_time,
             plan_end_time=plan_end_time,
+            print_score=True,
         )
     else:
         run_plan(
-            vessel_key=args.vessel_key or 6861435,
+            vessel_key=args.vessel_key or 15623707,
             type=args.plan_type,
             save_visualization=args.visualize,
             visualization_path=args.visualization_path,
             plan_start_time=plan_start_time,
             plan_end_time=plan_end_time,
+            print_score=True,
         )

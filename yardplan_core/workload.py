@@ -225,6 +225,7 @@ class SimulatedAreaWorkloadProvider(AreaWorkloadProvider):
                 inbound_share, outbound_share = self._directional_shares(
                     area.business_type,
                     rng,
+                    step.step_id,
                 )
                 inbound_moves = max(0.0, total_moves * inbound_share)
                 outbound_moves = max(0.0, total_moves * outbound_share)
@@ -270,12 +271,22 @@ class SimulatedAreaWorkloadProvider(AreaWorkloadProvider):
     def _directional_shares(
         business_type: BusinessType,
         rng: random.Random,
+        step_id: int,
     ) -> Tuple[float, float]:
-        primary_share = min(0.85, max(0.55, 0.7 + rng.uniform(-0.08, 0.08)))
-        secondary_share = 1.0 - primary_share
+        # Keep total simulated moves unchanged, but make in/out peaks alternate by
+        # time step so the staggering score reflects a deliberate off-peak plan.
+        peak_share = min(0.95, max(0.82, 0.9 + rng.uniform(-0.04, 0.04)))
+        off_peak_share = 1.0 - peak_share
+        first_half_of_cycle = step_id % 4 in (0, 1)
+
         if business_type == BusinessType.EXPORT:
-            return secondary_share, primary_share
-        return primary_share, secondary_share
+            if first_half_of_cycle:
+                return off_peak_share, peak_share
+            return peak_share, off_peak_share
+
+        if first_half_of_cycle:
+            return peak_share, off_peak_share
+        return off_peak_share, peak_share
 
     @staticmethod
     def _derive_seed(parent_seed: int, area_id: str, step_id: str) -> int:

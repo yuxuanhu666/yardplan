@@ -19,6 +19,7 @@ from yardplan_core.models import (
     Vessel,
     logger,
 )
+from yardplan_score import format_score_report, score_yard_plan
 
 
 class ResultFormatter:
@@ -217,6 +218,7 @@ class YardPlanner:
         mode: PlannerMode = PlannerMode.FULL_PLAN,
         horizon_start: Optional[datetime] = None,
         horizon_end: Optional[datetime] = None,
+        print_score: bool = False,
     ) -> PlanningResult:
         run_id = f"PLAN-{uuid.uuid4().hex[:12].upper()}"
         timestamp = datetime.now()
@@ -279,6 +281,13 @@ class YardPlanner:
         result.metrics["data"] = range_plan["data"]
 
         self.formatter.print_summary(result)
+        if print_score:
+            score = score_yard_plan(
+                result,
+                yard_areas=yard_areas,
+                workload_snapshot=workload_snapshot,
+            )
+            print(format_score_report(score, indent="  "))
         return result
 
     def plan_groups(
@@ -289,6 +298,7 @@ class YardPlanner:
         mode: PlannerMode = PlannerMode.FULL_PLAN,
         horizon_start: Optional[datetime] = None,
         horizon_end: Optional[datetime] = None,
+        print_score: bool = False,
     ) -> PlanningResult:
         run_id = f"PLAN-{uuid.uuid4().hex[:12].upper()}"
         timestamp = datetime.now()
@@ -341,6 +351,13 @@ class YardPlanner:
         result.metrics["data"] = range_plan["data"]
 
         self.formatter.print_summary(result)
+        if print_score:
+            score = score_yard_plan(
+                result,
+                yard_areas=yard_areas,
+                workload_snapshot=workload_snapshot,
+            )
+            print(format_score_report(score, indent="  "))
         return result
 
     def plan_groups_with_yard_space(
@@ -354,6 +371,7 @@ class YardPlanner:
         apply_to_yard: bool = False,
         horizon_start: Optional[datetime] = None,
         horizon_end: Optional[datetime] = None,
+        print_score: bool = False,
     ) -> PlanningResult:
         yard_areas, _slot_registry = YardSpaceAdapter.build_yard_areas(
             yard,
@@ -367,6 +385,7 @@ class YardPlanner:
             mode=mode,
             horizon_start=horizon_start,
             horizon_end=horizon_end,
+            print_score=print_score,
         )
         if apply_to_yard:
             assignments = YardSpaceAdapter.apply_allocation(result, yard)
@@ -399,6 +418,7 @@ class YardPlanner:
         apply_to_yard: bool = False,
         horizon_start: Optional[datetime] = None,
         horizon_end: Optional[datetime] = None,
+        print_score: bool = False,
     ) -> PlanningResult:
         yard_areas, _slot_registry = YardSpaceAdapter.build_yard_areas(
             yard,
@@ -412,6 +432,7 @@ class YardPlanner:
             mode=mode,
             horizon_start=horizon_start,
             horizon_end=horizon_end,
+            print_score=print_score,
         )
         if apply_to_yard:
             assignments = YardSpaceAdapter.apply_allocation(result, yard)

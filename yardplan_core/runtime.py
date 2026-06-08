@@ -36,10 +36,24 @@ def _range_plan_data(result: PlanningResult) -> List[Dict[str, Any]]:
     return result.metrics.get("range_plan", {}).get("data", [])
 
 
+def _normalize_key(
+    loader: TOSLoader,
+    raw_key: Optional[int],
+    label: str,
+) -> Optional[int]:
+    if raw_key is None:
+        return None
+
+    key = loader._coerce_line_key(raw_key)
+    if key is None:
+        raise ValueError(f"Invalid {label}: {raw_key!r}")
+    return key
+
+
 def run_plan(
     token: Optional[str] = None,
     *,
-    line_keys: Optional[List[int]] = None,
+    line_keys: Optional[int] = None,
     vessel_key: Optional[int] = None,
     type: int = 1,
     apply_to_yard: bool = False,
@@ -50,12 +64,14 @@ def run_plan(
     plan_start_time: Optional[datetime] = None,
     plan_end_time: Optional[datetime] = None,
     return_list: bool = False,
+    print_score: bool = False,
 ) -> Union[PlanningResult, List[Dict[str, Any]]]:
     """
     规划入口：传入一个或多个航线号，完成进出口箱堆场分配规划。
 
     token: 第一个参数，TOS/平台访问令牌（str），默认 None；不传时由调用方（如 FastAPI）决定是否回退到服务注册 token。
-    line_keys: 航线号列表（keyword-only）。
+    line_keys: 航线号（keyword-only），对应请求体 serviceLineKey。
+    vessel_key: VesselVisit 顶层 dbkey（keyword-only），对应请求体 vesselVisitKey；与 line_keys 二选一。
     return_list: 为 True 时直接返回 API 用的分配组列表（等同 metrics["range_plan"]["data"]）；
         为 False 时返回完整 PlanningResult（本地调试、可视化用）。
 
@@ -71,18 +87,10 @@ def run_plan(
     )
 
     loader = TOSLoader(token=token)
-    normalized_line_keys: List[int] = []
-    for raw_key in line_keys or []:
-        line_key = loader._coerce_line_key(raw_key)
-        if line_key is None:
-            raise ValueError(f"无效的 lineKey: {raw_key!r}")
-        normalized_line_keys.append(line_key)
+    normalized_line_key = _normalize_key(loader, line_keys, "lineKey")
+    normalized_vessel_key = _normalize_key(loader, vessel_key, "VesselVisit dbkey")
 
-    normalized_vessel_key = loader._coerce_line_key(vessel_key)
-    if vessel_key is not None and normalized_vessel_key is None:
-        raise ValueError(f"Invalid vesselKey: {vessel_key!r}")
-
-    has_line_keys = len(normalized_line_keys) > 0
+    has_line_keys = normalized_line_key is not None
     has_vessel_key = normalized_vessel_key is not None
     if has_line_keys == has_vessel_key:
         raise ValueError("Provide exactly one of line_keys or vessel_key")
@@ -91,14 +99,14 @@ def run_plan(
 
     print("=" * 70)
     if has_vessel_key:
-        print(f"  vesselKey: {normalized_vessel_key}")
-    print(f"  堆场规划  type={type}  lineKeys: {normalized_line_keys}")
+        print(f"  visitDbkey: {normalized_vessel_key}")
+    print(f"  堆场规划  type={type}  lineKey: {normalized_line_key}")
     if plan_start_time is not None and plan_end_time is not None:
         print(f"  规划范围: {plan_start_time} → {plan_end_time}")
     print("=" * 70)
 
     vessels = loader.load_vessels(
-        line_keys=normalized_line_keys,
+        line_keys=normalized_line_key,
         vessel_key=normalized_vessel_key,
         plan_start_time=plan_start_time,
         plan_end_time=plan_end_time,
@@ -122,12 +130,12 @@ def run_plan(
 
     if type == 1:
         import_containers = loader.load_discharge_containers(
-            line_keys=normalized_line_keys,
+            line_keys=normalized_line_key,
             vessel_key=normalized_vessel_key,
             vessels=vessels,
         )
         export_containers = loader.load_loading_containers(
-            line_keys=normalized_line_keys,
+            line_keys=normalized_line_key,
             vessel_key=normalized_vessel_key,
             vessels=vessels,
         )
@@ -153,7 +161,7 @@ def run_plan(
             )
     else:
         external_groups = loader.load_external_allocation_groups(
-            normalized_line_keys,
+            normalized_line_key,
             vessels,
         )
         if not external_groups:
@@ -193,6 +201,7 @@ def run_plan(
             apply_to_yard=apply_to_yard,
             horizon_start=horizon_start,
             horizon_end=horizon_end,
+            print_score=print_score,
         )
     else:
         result = planner.plan_groups_with_yard_space(
@@ -204,6 +213,7 @@ def run_plan(
             apply_to_yard=apply_to_yard,
             horizon_start=horizon_start,
             horizon_end=horizon_end,
+            print_score=print_score,
         )
 
     range_items = _range_plan_data(result)
