@@ -166,6 +166,7 @@ class YardSpaceAdapter:
                 bays=bays,
                 large_bay_pairs=large_bay_pairs,
                 max_stack_height=MAX_TIERS_PER_COLUMN,
+                center_coordinate=YardSpaceAdapter._block_center_coordinate(stack_dict),
             )
             area._stage2_single_slots = stage2_single_slots
             area._stage2_large_slots = stage2_large_slots
@@ -318,6 +319,28 @@ class YardSpaceAdapter:
         return fallback_bays
 
     @staticmethod
+    def _block_center_coordinate(
+        stack_dict: Dict[Tuple[int, int], Dict[str, Any]],
+    ) -> Optional[Tuple[float, float]]:
+        points: List[Tuple[float, float]] = []
+        for stack_info in stack_dict.values():
+            for tier_data in (stack_info.get("tiers") or {}).values():
+                coord = tier_data.get("coordinate") or {}
+                if "x" not in coord or "y" not in coord:
+                    continue
+                try:
+                    points.append((float(coord["x"]), float(coord["y"])))
+                except (TypeError, ValueError):
+                    continue
+                break
+
+        if not points:
+            return None
+        xs = [point[0] for point in points]
+        ys = [point[1] for point in points]
+        return (min(xs) + max(xs)) / 2.0, (min(ys) + max(ys)) / 2.0
+
+    @staticmethod
     def apply_allocation(
         result: PlanningResult,
         yard: Any,
@@ -390,6 +413,9 @@ class TOSLoader:
         self,
         vessel_visit_path: Optional[str] = None,
         bound_list_path: Optional[str] = None,
+        berth_plan_path: Optional[str] = None,
+        berth_data_path: Optional[str] = None,
+        wq_path: Optional[str] = None,
         token: Optional[str] = None,
     ):
         self.token = token
@@ -402,6 +428,251 @@ class TOSLoader:
             "217getBoundList（装船箱和卸船箱列表）.json",
         )
 
+        self.berth_plan_path = berth_plan_path or os.path.join(
+            _DATA_DIR,
+            "berthplan泊位计划.json",
+        )
+        self.berth_data_path = berth_data_path or os.path.join(
+            _DATA_DIR,
+            "217泊位数据.json",
+        )
+
+        self.wq_path = wq_path or os.path.join(_DATA_DIR, "217_WQ.json")
+
+    def _load_berth_plans_by_visit_key(self) -> Dict[int, Dict[str, Any]]:
+        try:
+            with open(self.berth_plan_path, "r", encoding="utf-8") as file:
+                raw = json.load(file)
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("TOSLoader: failed to load berth plans: %s", exc)
+            return {}
+
+        plans = raw.get("data", {}).get("listBerthPlan", []) if isinstance(raw, dict) else []
+        by_visit_key: Dict[int, Dict[str, Any]] = {}
+        for plan in plans:
+            visit_key = self._coerce_line_key(plan.get("vesselVisitKey"))
+            if visit_key is None:
+                continue
+            current = by_visit_key.get(visit_key)
+            if current is None or self._berth_plan_sort_key(plan) < self._berth_plan_sort_key(current):
+                by_visit_key[visit_key] = plan
+        return by_visit_key
+
+    def _load_berth_centers(self) -> Dict[int, Tuple[float, float]]:
+        try:
+            with open(self.berth_data_path, "r", encoding="utf-8") as file:
+                raw = json.load(file)
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("TOSLoader: failed to load berth data: %s", exc)
+            return {}
+
+        centers: Dict[int, Tuple[float, float]] = {}
+        berth_map = raw.get("berthMap", {}) if isinstance(raw, dict) else {}
+        for raw_key, berth in berth_map.items():
+            berth_key = self._coerce_line_key(berth.get("berthKey", raw_key))
+            start = berth.get("startCoordinate") or {}
+            end = berth.get("endCoordinate") or {}
+            if berth_key is None:
+                continue
+            try:
+                centers[berth_key] = (
+                    (float(start["x"]) + float(end["x"])) / 2.0,
+                    (float(start["y"]) + float(end["y"])) / 2.0,
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+        return centers
+
+    @staticmethod
+    def _berth_plan_sort_key(plan: Dict[str, Any]) -> Tuple[int, str, int]:
+        seq = plan.get("seq")
+        try:
+            seq_value = int(seq) if seq is not None else 999999
+        except (TypeError, ValueError):
+            seq_value = 999999
+        return seq_value, str(plan.get("eta") or ""), int(plan.get("dbkey") or 0)
+
+    def load_departed_loading_container_ids(
+        self,
+        *,
+        target_vessel_key: int,
+        target_eta: datetime,
+        plan_start_time: Optional[datetime] = None,
+        plan_end_time: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        target_key = self._coerce_line_key(target_vessel_key)
+        empty_result = {
+            "candidate_vessels": [],
+            "container_ids": [],
+            "containers_by_vessel": {},
+        }
+        if target_key is None:
+            return empty_result
+
+        try:
+            with open(self.vessel_visit_path, "r", encoding="utf-8") as file:
+                visits: List[dict] = json.load(file)
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("TOSLoader: failed to load vessel visits for yard cleanup: %s", exc)
+            return empty_result
+
+        candidates: Dict[int, Dict[str, Any]] = {}
+        for item in visits:
+            visit_key = self._coerce_line_key(item.get("dbkey"))
+            if visit_key is None or visit_key == target_key:
+                continue
+
+            etd = self._parse_dt(item.get("etd"))
+            if etd is None or etd >= target_eta:
+                continue
+            if plan_start_time is not None and etd < plan_start_time:
+                continue
+            if plan_end_time is not None and etd >= plan_end_time:
+                continue
+
+            candidates[visit_key] = {
+                "vesselVisitKey": visit_key,
+                "vesselVisitId": item.get("vesselVisitId") or "",
+                "etd": etd,
+            }
+
+        if not candidates:
+            return empty_result
+
+        try:
+            with open(self.wq_path, "r", encoding="utf-8") as file:
+                raw = json.load(file)
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("TOSLoader: failed to load WQ data for yard cleanup: %s", exc)
+            return {
+                "candidate_vessels": list(candidates.values()),
+                "container_ids": [],
+                "containers_by_vessel": {},
+            }
+
+        wq_list = raw.get("data", {}).get("wqList", []) if isinstance(raw, dict) else []
+        container_ids: List[str] = []
+        seen: Set[str] = set()
+        containers_by_vessel: Dict[int, List[str]] = defaultdict(list)
+
+        for wq in wq_list:
+            visit_key = self._coerce_line_key(wq.get("vesselVisitKey"))
+            if visit_key not in candidates:
+                continue
+            if not self._is_loading_wq(wq):
+                continue
+            for container_id in wq.get("wiContrIdList") or []:
+                if not container_id or container_id in seen:
+                    continue
+                seen.add(container_id)
+                container_ids.append(container_id)
+                containers_by_vessel[visit_key].append(container_id)
+
+        candidate_vessels = list(candidates.values())
+        for vessel in candidate_vessels:
+            vessel["loadingContainerCount"] = len(
+                containers_by_vessel.get(vessel["vesselVisitKey"], [])
+            )
+
+        return {
+            "candidate_vessels": candidate_vessels,
+            "container_ids": container_ids,
+            "containers_by_vessel": dict(containers_by_vessel),
+        }
+
+    @staticmethod
+    def _is_loading_wq(wq: Dict[str, Any]) -> bool:
+        qtype = wq.get("qtype")
+        if qtype == 1 or str(qtype).strip() == "1":
+            return True
+        wq_id = str(wq.get("wqId") or wq.get("name") or "").upper()
+        return "LOAD" in wq_id
+
+    def load_loading_wq_containers_for_window(
+        self,
+        *,
+        target_vessel_key: int,
+        window_start: datetime,
+        window_end: datetime,
+    ) -> Dict[str, Any]:
+        target_key = self._coerce_line_key(target_vessel_key)
+        empty_result = {
+            "candidate_vessels": [],
+            "containers_by_vessel": {},
+        }
+        if target_key is None or window_end <= window_start:
+            return empty_result
+
+        try:
+            with open(self.vessel_visit_path, "r", encoding="utf-8") as file:
+                visits: List[dict] = json.load(file)
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("TOSLoader: failed to load vessel visits for yard busy profile: %s", exc)
+            return empty_result
+
+        candidates: Dict[int, Dict[str, Any]] = {}
+        for item in visits:
+            visit_key = self._coerce_line_key(item.get("dbkey"))
+            if visit_key is None or visit_key == target_key:
+                continue
+            eta = self._parse_dt(item.get("eta"))
+            etd = self._parse_dt(item.get("etd"))
+            if eta is None and etd is None:
+                continue
+            visit_start = eta or window_start
+            visit_end = etd or (visit_start + timedelta(hours=48))
+            if visit_end <= visit_start:
+                visit_end = visit_start + timedelta(hours=48)
+            if visit_start >= window_end or visit_end <= window_start:
+                continue
+            candidates[visit_key] = {
+                "vesselVisitKey": visit_key,
+                "vesselVisitId": item.get("vesselVisitId") or "",
+                "eta": eta,
+                "etd": etd,
+            }
+
+        if not candidates:
+            return empty_result
+
+        try:
+            with open(self.wq_path, "r", encoding="utf-8") as file:
+                raw = json.load(file)
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("TOSLoader: failed to load WQ data for yard busy profile: %s", exc)
+            return {
+                "candidate_vessels": list(candidates.values()),
+                "containers_by_vessel": {},
+            }
+
+        wq_list = raw.get("data", {}).get("wqList", []) if isinstance(raw, dict) else []
+        containers_by_vessel: Dict[int, List[str]] = defaultdict(list)
+        seen_by_vessel: Dict[int, Set[str]] = defaultdict(set)
+
+        for wq in wq_list:
+            visit_key = self._coerce_line_key(wq.get("vesselVisitKey"))
+            if visit_key not in candidates:
+                continue
+            if not self._is_loading_wq(wq):
+                continue
+            seen = seen_by_vessel[visit_key]
+            for container_id in wq.get("wiContrIdList") or []:
+                if not container_id or container_id in seen:
+                    continue
+                seen.add(container_id)
+                containers_by_vessel[visit_key].append(container_id)
+
+        candidate_vessels = list(candidates.values())
+        for vessel in candidate_vessels:
+            vessel["loadingContainerCount"] = len(
+                containers_by_vessel.get(vessel["vesselVisitKey"], [])
+            )
+
+        return {
+            "candidate_vessels": candidate_vessels,
+            "containers_by_vessel": dict(containers_by_vessel),
+        }
+
     def load_vessels(
         self,
         line_keys: Optional[int] = None,
@@ -411,6 +682,9 @@ class TOSLoader:
     ) -> Dict[str, Vessel]:
         with open(self.vessel_visit_path, "r", encoding="utf-8") as file:
             raw: List[dict] = json.load(file)
+
+        berth_plans = self._load_berth_plans_by_visit_key()
+        berth_centers = self._load_berth_centers()
 
         target_set = self._coerce_line_key_set(line_keys)
         target_visit_dbkeys = self._coerce_line_key_set(vessel_key)
@@ -444,6 +718,9 @@ class TOSLoader:
             vessel_info = item.get("vesselInfo") or {}
             vessel_id_str = vessel_info.get("id") or vessel_visit_id
             vessel_name = vessel_info.get("name") or ""
+            berth_plan = berth_plans.get(item_visit_dbkey or -1, {})
+            berth_key = self._coerce_line_key(berth_plan.get("berthKey"))
+            berth_coordinate = berth_centers.get(berth_key) if berth_key is not None else None
 
             vessels[vessel_visit_id] = Vessel(
                 vessel_id=vessel_id_str,
@@ -451,7 +728,9 @@ class TOSLoader:
                 voyage_id=vessel_visit_id,
                 eta=eta or datetime.now(),
                 etd=etd or (datetime.now() + timedelta(hours=48)),
-                berth_id="",
+                berth_id=str(berth_key or ""),
+                berth_key=berth_key,
+                berth_coordinate=berth_coordinate,
             )
 
         missing = target_set - matched_line_keys

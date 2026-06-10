@@ -60,6 +60,7 @@ class YardSpace:
         self.occupied_20ft = set()
         self.occupied_40ft = set()
         self.slot_occupant = {}  # fullSlotName -> {"cid": str, "size": "20ft"|"40ft"|"45ft"}
+        self.container_slot = {}  # containerId -> main fullSlotName
         self.stacks = {}         # (blockId, bayIdx, stackIdx) -> stack_info
         self.cnt_by_size = {"20ft": 0, "40ft": 0, "45ft": 0}
 
@@ -105,6 +106,7 @@ class YardSpace:
                     "bayIdx":  info["bayIdx"],
                     "stackIdx": info["stackIdx"],
                     "tierIdx": tier_idx,
+                    "coordinate": info.get("coordinate"),
                 }
             elif slot_size == 2:
                 related = [
@@ -118,6 +120,7 @@ class YardSpace:
                     "stackIdx": info["stackIdx"],
                     "tierIdx": tier_idx,
                     "related_20ft": related,
+                    "coordinate": info.get("coordinate"),
                 }
                 for r_name in related:
                     self.twenty_to_forty[r_name].append(full_name)
@@ -145,6 +148,7 @@ class YardSpace:
 
             self.cnt_by_size[size_label] += 1
             occ_info = {"cid": cid, "size": size_label}
+            self.container_slot[cid] = full_name
 
             if slot_size == 1:
                 self.occupied_20ft.add(full_name)
@@ -174,6 +178,7 @@ class YardSpace:
             if tier not in tiers:
                 tiers[tier] = {}
             tiers[tier]["slot_20ft"] = name
+            tiers[tier]["coordinate"] = info.get("coordinate")
             tiers[tier]["free_20ft"] = name not in self.occupied_20ft
             tiers[tier]["occupant"] = self.slot_occupant.get(name)
 
@@ -260,6 +265,7 @@ class YardSpace:
         if full_slot_name in self.slots_20ft:
             self.occupied_20ft.add(full_slot_name)
             self.slot_occupant[full_slot_name] = occ_info
+            self.container_slot[container_id] = full_slot_name
             info = self.slots_20ft[full_slot_name]
             sk = (info["blockId"], info["bayIdx"], info["stackIdx"])
             tier = info["tierIdx"]
@@ -275,6 +281,7 @@ class YardSpace:
         elif full_slot_name in self.slots_40ft:
             self.occupied_40ft.add(full_slot_name)
             self.slot_occupant[full_slot_name] = occ_info
+            self.container_slot[container_id] = full_slot_name
             info = self.slots_40ft[full_slot_name]
             sk = (info["blockId"], info["bayIdx"], info["stackIdx"])
             affected.add(sk)
@@ -314,6 +321,7 @@ class YardSpace:
         if occ is None:
             raise ValueError(f"槽位 {full_slot_name} 没有箱子")
 
+        self.container_slot.pop(occ.get("cid"), None)
         affected = set()
 
         if full_slot_name in self.slots_20ft:
@@ -352,6 +360,35 @@ class YardSpace:
         for sk in affected:
             self._refresh_stack_top(sk)
         self.cnt_by_size[occ["size"]] -= 1
+
+    def remove_container_by_id(self, container_id):
+        """Remove a container from its current main slot."""
+        full_slot_name = self.container_slot.get(container_id)
+        if not full_slot_name:
+            for slot_name, occ in self.slot_occupant.items():
+                if occ.get("cid") == container_id:
+                    full_slot_name = slot_name
+                    break
+        if not full_slot_name:
+            return False
+
+        try:
+            self.remove_container(full_slot_name)
+        except ValueError:
+            self.container_slot.pop(container_id, None)
+            return False
+        return True
+
+    def get_container_block_id(self, container_id):
+        """Return the current block id for a container, if it is in the yard."""
+        full_slot_name = self.container_slot.get(container_id)
+        if not full_slot_name:
+            return None
+        info = self.slots_20ft.get(full_slot_name) or self.slots_40ft.get(full_slot_name)
+        if info:
+            return info.get("blockId")
+        prefix = full_slot_name.split(".", 1)[0]
+        return prefix.replace("Y-", "") if prefix else None
 
     # ================================================================
     #  查询接口

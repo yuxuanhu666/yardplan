@@ -125,6 +125,9 @@ if __name__ == "__main__":
     import argparse
     from datetime import datetime
 
+    default_start = datetime.fromisoformat("2026-03-25T00:00:00")
+    default_end = datetime.fromisoformat("2026-04-10T00:00:00")
+
     # 航次 YH25004（远航888）：ETA 2025-12-21 16:00，ETD 2025-12-25 16:00
     parser = argparse.ArgumentParser(description="Local yard planning test runner")
     target = parser.add_mutually_exclusive_group()
@@ -141,8 +144,18 @@ if __name__ == "__main__":
         help="VesselVisit dbkey.",
     )
     parser.add_argument("--type", dest="plan_type", type=int, default=1)
-    parser.add_argument("--start", type=str, help="Plan start time, e.g. 2025-12-21T00:00:00")
-    parser.add_argument("--end", type=str, help="Plan end time, e.g. 2025-12-26T00:00:00")
+    parser.add_argument(
+        "--start",
+        type=str,
+        default=default_start.isoformat(),
+        help="Plan start time, e.g. 2025-12-21T00:00:00",
+    )
+    parser.add_argument(
+        "--end",
+        type=str,
+        default=default_end.isoformat(),
+        help="Plan end time, e.g. 2025-12-26T00:00:00",
+    )
     parser.add_argument(
         "--visualize",
         dest="visualize",
@@ -163,8 +176,8 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    plan_start_time = datetime.fromisoformat(args.start) if args.start else None
-    plan_end_time = datetime.fromisoformat(args.end) if args.end else None
+    plan_start_time = datetime.fromisoformat(args.start) if args.start else default_start
+    plan_end_time = datetime.fromisoformat(args.end) if args.end else default_end
 
     if args.line_keys:
         run_plan(

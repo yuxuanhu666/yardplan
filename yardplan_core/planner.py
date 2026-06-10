@@ -414,6 +414,7 @@ class YardPlanner:
         block_business_types: Dict[str, BusinessType],
         vessels: Optional[Dict[str, Vessel]] = None,
         block_ids: Optional[List[str]] = None,
+        yard_busy_profile: Optional[Dict[str, Any]] = None,
         mode: PlannerMode = PlannerMode.FULL_PLAN,
         apply_to_yard: bool = False,
         horizon_start: Optional[datetime] = None,
@@ -425,6 +426,7 @@ class YardPlanner:
             block_business_types,
             block_ids,
         )
+        self._attach_yard_busy_profile(yard_areas, yard_busy_profile)
         result = self.plan(
             containers=containers,
             yard_areas=yard_areas,
@@ -441,6 +443,23 @@ class YardPlanner:
                 f"已将规划结果写回 YardSpace: {len(assignments)} 个容器获得槽位"
             )
         return result
+
+    @staticmethod
+    def _attach_yard_busy_profile(
+        yard_areas: List[YardArea],
+        yard_busy_profile: Optional[Dict[str, Any]],
+    ) -> None:
+        if not yard_busy_profile or not yard_busy_profile.get("enabled"):
+            return
+        area_profiles = yard_busy_profile.get("areas") or {}
+        for area in yard_areas:
+            profile = area_profiles.get(area.area_id)
+            if not profile:
+                continue
+            area._stage1_busy_profile = profile
+            area._stage1_peak_busy_ratio = float(profile.get("peakBusyRatio") or 0.0)
+            area._stage1_capacity_factor = float(profile.get("capacityFactor") or 1.0)
+            area._stage1_hard_blocked = bool(profile.get("hardBlocked"))
 
 
 __all__ = ["ResultFormatter", "YardPlanner"]

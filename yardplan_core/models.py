@@ -233,6 +233,7 @@ class YardArea:
         }
     )
     max_stack_height: int = MAX_TIERS_PER_COLUMN
+    center_coordinate: Optional[Tuple[float, float]] = None
     distance_to_gate: float = 0.0
     distance_to_berth: Dict[str, float] = field(default_factory=dict)
 
@@ -280,6 +281,8 @@ class Vessel:
     eta: datetime
     etd: datetime
     berth_id: str
+    berth_key: Optional[int] = None
+    berth_coordinate: Optional[Tuple[float, float]] = None
     discharge_containers: List[Container] = field(default_factory=list)
     loading_containers: List[Container] = field(default_factory=list)
 

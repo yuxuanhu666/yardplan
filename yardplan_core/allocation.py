@@ -26,7 +26,6 @@ from yardplan_core.workload import (
     AreaWorkloadSnapshot,
     SimulatedAreaWorkloadProvider,
     WorkloadEstimationConfig,
-    print_eta_step_workloads,
 )
 
 
@@ -135,6 +134,11 @@ class ConstraintChecker:
         if group.size not in area.supported_sizes:
             return False
         if group.is_edge_only and not area.get_edge_pairs():
+            return False
+        if (
+            group.business_type == BusinessType.EXPORT
+            and getattr(area, "_stage1_hard_blocked", False)
+        ):
             return False
         return True
 
@@ -496,32 +500,18 @@ class Stage1LNSConfig:
     max_iterations: int = 120
     no_improve_limit: int = 20
     destroy_fraction: float = 0.2
-    hotspot_area_count: int = 3
-    hotspot_destroy_fraction: Optional[float] = None
-    stage1_destroy_operator: str = "adaptive"
-    stage1_repair_operator: str = "adaptive"
+    stage1_destroy_operator: str = "random"
+    stage1_repair_operator: str = "random"
     random_seed: int = 17
     time_limit_seconds: Optional[float] = None
     workload_provider: Optional[str] = "simulated"
     workload_soft_capacity_ratio: float = 0.85
-    workload_balance_weight: float = 13.0
-    workload_use_target_eta_step_only: bool = True
-    workload_non_target_step_weight: float = 0.0
     line_small_fragment_weight: float = 5.0
-    split_weight: float = 12.0
-    large_group_split_discount: float = 0.45
-    small_group_split_premium: float = 1.2
     export_target_containers_per_area: int = 80
     import_target_containers_per_area: int = 120
-    min_split_part_containers: int = 25
-    group_peak_weight: float = 100.0
-    fragment_weight: float = 12.0
-    base_split_weight: float = 6.0
-    workload_area_soft_target_export: float = 80.0
-    workload_area_soft_target_import: float = 120.0
-    workload_overload_weight: float = 15.0
-    workload_spread_weight_scale: float = 0.15
     physical_weight: float = 10.0
+    berth_distance_weight: float = 1.0
+    busy_profile_weight: float = 160.0
     unassigned_weight: float = 10000.0
     line_max_area_share_threshold: float = 0.45
     line_share_penalty_weight: float = 24.0
@@ -534,23 +524,14 @@ class Stage1LNSConfig:
     repair_top_k: int = 5
     repair_random_tie_break: bool = True
     repair_tie_tolerance: float = 1e-6
-    repair_workload_penalty_weight: float = 0.3
-    repair_underload_reward_weight: float = 0.05
     repair_physical_bias_weight: float = 1.0
     repair_congestion_weight: float = 8.0
     repair_split_bias_weight: float = 3.0
     repair_congestion_load_ratio: float = 0.5
     repair_regret_recompute_interval: int = 1
-    bay_pressure_workload_weight: float = 1.0
-    bay_pressure_group_weight: float = 0.5
-    bay_pressure_load_ratio_weight: float = 0.3
-    bay_pressure_fragment_weight: float = 1.2
-    bay_pressure_mix_weight: float = 0.4
-    bay_pressure_large_group_boost: float = 1.5
     guard_competition_weight: float = 12.0
     guard_fragment_weight: float = 6.0
     guard_headroom_weight: float = 15.0
-    guard_workload_penalty_weight: float = 0.3
     guard_split_weight: float = 3.0
     guard_max_competition_ratio: float = 2.5
     guard_min_headroom_ratio: float = 0.5
@@ -596,8 +577,9 @@ class Stage1CostContext:
     states: Dict[str, AreaResourceState]
     area_load: Dict[str, int]
     line_area_load: Dict[Tuple[Optional[int], str], int]
-    workload_overlay: Dict[Tuple[str, int], Tuple[float, float]]
     physical_cost: float = 0.0
+    berth_distance_cost: float = 0.0
+    busy_profile_cost: float = 0.0
     infeasible_count: int = 0
 
     def clone(self) -> "Stage1CostContext":
@@ -605,8 +587,9 @@ class Stage1CostContext:
             states={area_id: state.clone() for area_id, state in self.states.items()},
             area_load=defaultdict(int, self.area_load),
             line_area_load=defaultdict(int, self.line_area_load),
-            workload_overlay=dict(self.workload_overlay),
             physical_cost=self.physical_cost,
+            berth_distance_cost=self.berth_distance_cost,
+            busy_profile_cost=self.busy_profile_cost,
             infeasible_count=self.infeasible_count,
         )
 
@@ -662,11 +645,8 @@ class Stage1YardAreaAssigner:
     AreaAssignment and unassigned groups; exact
     bay/range allocation remains a second-stage concern.
 
-    Workload balance is measured in RTG moves (箱次), not columns. Baseline
-    moves come from `AreaWorkloadSnapshot`; planned overlay comes from
-    `AllocationGroup.container_count`, evenly spread across the voyage's
-    ETA~ETD step span. Capacity and workload stay decoupled: `column_demand`
-    is still used for yard capacity, but never as the workload metric.
+    Time-step workload is currently ignored in the first-stage objective;
+    `column_demand` is still used for yard capacity checks.
     """
 
     def __init__(
@@ -685,6 +665,7 @@ class Stage1YardAreaAssigner:
         )
         self.workload_snapshot: Optional[AreaWorkloadSnapshot] = None
         self._vessels: Dict[str, Vessel] = {}
+        self._area_by_id: Dict[str, YardArea] = {}
         self._time_steps: List[TimeStep] = []
         self._voyage_step_span: Dict[str, List[int]] = {}
         self._last_search_summary: Dict[str, object] = {}
@@ -781,6 +762,7 @@ class Stage1YardAreaAssigner:
     ) -> Tuple[List[AreaAssignment], List[AllocationGroup]]:
         original_groups = list(groups)
         area_by_id = {area.area_id: area for area in yard_areas}
+        self._area_by_id = dict(area_by_id)
 
         solution = self._construct_initial_solution(original_groups, yard_areas)
         best = self._run_lns(solution, original_groups, yard_areas)
@@ -946,7 +928,6 @@ class Stage1YardAreaAssigner:
                     states=repair_states,
                 )
 
-        self._log_workload_balance(best, group_by_id, yard_areas)
         self._log_unassigned_diagnostics(best, group_by_id, yard_areas)
         self._last_search_summary = {
             "search_label": self._search_algorithm_label(),
@@ -974,24 +955,25 @@ class Stage1YardAreaAssigner:
         return best
 
     def _use_adaptive_operator_selection(self) -> bool:
-        destroy = (self.config.stage1_destroy_operator or "adaptive").lower()
-        repair = (self.config.stage1_repair_operator or "adaptive").lower()
-        return destroy == "adaptive" or repair == "adaptive"
+        return (
+            len(self._destroy_operator_pool()) > 1
+            or len(self._repair_operator_pool()) > 1
+        )
 
     def _search_algorithm_label(self) -> str:
         return "ALNS" if self._use_adaptive_operator_selection() else "LNS"
 
     def _destroy_operator_pool(self) -> List[str]:
-        destroy = (self.config.stage1_destroy_operator or "adaptive").lower()
-        if destroy == "adaptive":
-            return ["random", "workload_hotspot", "bay_pressure"]
-        return [destroy]
+        destroy = (self.config.stage1_destroy_operator or "random").lower()
+        if destroy in {"adaptive", "auto", "random"}:
+            return ["random"]
+        raise ValueError(f"未知 stage1_destroy_operator: {destroy!r}")
 
     def _repair_operator_pool(self) -> List[str]:
-        repair = (self.config.stage1_repair_operator or "adaptive").lower()
-        if repair == "adaptive":
-            return ["random", "workload_balanced", "stage2_guarded"]
-        return [self._resolve_repair_operator()]
+        repair = (self.config.stage1_repair_operator or "random").lower()
+        if repair in {"adaptive", "auto", "random"}:
+            return ["random"]
+        raise ValueError(f"未知 stage1_repair_operator: {repair!r}")
 
     def _select_alns_operator(
         self,
@@ -1094,11 +1076,12 @@ class Stage1YardAreaAssigner:
     ) -> float:
         context = self._replay_solution(solution, group_by_id, yard_areas)
         cost = (context.infeasible_count + len(solution.unassigned_group_ids)) * self.config.unassigned_weight
-        cost += self._time_step_workload_cost(context, yard_areas)
+        workload_cost = 0.0
+        cost += workload_cost
         cost += self._line_concentration_cost(context.line_area_load)
-        cost += self._group_dispersion_cost(solution, group_by_id)
-        cost += self._split_operation_cost(solution, group_by_id)
         cost += context.physical_cost * self.config.physical_weight
+        cost += context.berth_distance_cost * self.config.berth_distance_weight
+        cost += context.busy_profile_cost * self.config.busy_profile_weight
         return cost
 
     def evaluate_placement_delta(
@@ -1135,187 +1118,11 @@ class Stage1YardAreaAssigner:
         yard_areas: List[YardArea],
         operator: Optional[str] = None,
     ) -> List[str]:
-        op = operator or self.config.stage1_destroy_operator
-        if op == "bay_pressure":
-            return self._bay_pressure_destroy(
-                solution,
-                group_by_id,
-                yard_areas,
-            )
-        if op == "workload_hotspot":
-            return self._workload_hotspot_destroy(
-                solution,
-                group_by_id,
-                yard_areas,
-            )
-        if op == "random":
+        del group_by_id, yard_areas
+        op = (operator or self.config.stage1_destroy_operator or "random").lower()
+        if op in {"adaptive", "auto", "random"}:
             return self._random_destroy(solution)
         raise ValueError(f"未知 stage1_destroy_operator: {op!r}")
-
-    def _workload_hotspot_destroy(
-        self,
-        solution: Stage1Solution,
-        group_by_id: Dict[str, AllocationGroup],
-        yard_areas: List[YardArea],
-    ) -> List[str]:
-        assigned_ids = list(solution.placements_by_group.keys())
-        if not assigned_ids:
-            return []
-        if self.workload_snapshot is None:
-            return self._random_destroy(solution)
-
-        fraction = (
-            self.config.hotspot_destroy_fraction
-            if self.config.hotspot_destroy_fraction is not None
-            else self.config.destroy_fraction
-        )
-        remove_count = max(1, int(math.ceil(len(assigned_ids) * fraction)))
-        context = self._replay_solution(solution, group_by_id, yard_areas)
-        area_scores = self._compute_area_hotspot_scores(context, yard_areas)
-        hotspot_area_ids = self._select_hotspot_area_ids(area_scores, context, yard_areas)
-        group_scores = self._score_groups_on_hotspot_areas(
-            solution,
-            group_by_id,
-            area_scores,
-            hotspot_area_ids,
-        )
-        if not any(score > 0.0 for score in group_scores.values()):
-            return self._random_destroy(solution)
-
-        ranked_group_ids = sorted(
-            [group_id for group_id, score in group_scores.items() if score > 0.0],
-            key=lambda group_id: (-group_scores[group_id], self._rng.random()),
-        )
-        removed_ids = ranked_group_ids[:remove_count]
-        target_count = min(remove_count, len(assigned_ids))
-        if len(removed_ids) < target_count:
-            remaining_ids = [
-                group_id for group_id in assigned_ids if group_id not in set(removed_ids)
-            ]
-            supplement_count = target_count - len(removed_ids)
-            if supplement_count > 0 and remaining_ids:
-                removed_ids.extend(
-                    self._rng.sample(
-                        remaining_ids,
-                        min(supplement_count, len(remaining_ids)),
-                    )
-                )
-
-        logger.debug(
-            "Stage1 hotspot destroy: hotspot_areas=%s remove_count=%s",
-            sorted(hotspot_area_ids),
-            len(removed_ids),
-        )
-        return removed_ids
-
-    def _bay_pressure_destroy(
-        self,
-        solution: Stage1Solution,
-        group_by_id: Dict[str, AllocationGroup],
-        yard_areas: List[YardArea],
-    ) -> List[str]:
-        assigned_ids = list(solution.placements_by_group.keys())
-        if not assigned_ids:
-            return []
-        if self.workload_snapshot is None:
-            return self._random_destroy(solution)
-
-        fraction = (
-            self.config.hotspot_destroy_fraction
-            if self.config.hotspot_destroy_fraction is not None
-            else self.config.destroy_fraction
-        )
-        remove_count = max(1, int(math.ceil(len(assigned_ids) * fraction)))
-        context = self._replay_solution(solution, group_by_id, yard_areas)
-        pressure_scores = self._compute_bay_pressure_scores(solution, context, yard_areas)
-        hotspot_area_ids = self._select_hotspot_area_ids(
-            pressure_scores,
-            context,
-            yard_areas,
-        )
-        group_scores = self._score_groups_on_hotspot_areas(
-            solution,
-            group_by_id,
-            pressure_scores,
-            hotspot_area_ids,
-        )
-        for group_id, score in list(group_scores.items()):
-            group = group_by_id.get(group_id)
-            if group is None or score <= 0.0:
-                continue
-            group_scores[group_id] = score * self._bay_pressure_group_boost(group)
-
-        if not any(score > 0.0 for score in group_scores.values()):
-            return self._random_destroy(solution)
-
-        ranked_group_ids = sorted(
-            [group_id for group_id, score in group_scores.items() if score > 0.0],
-            key=lambda group_id: (-group_scores[group_id], self._rng.random()),
-        )
-        removed_ids = ranked_group_ids[:remove_count]
-        target_count = min(remove_count, len(assigned_ids))
-        if len(removed_ids) < target_count:
-            remaining_ids = [
-                group_id for group_id in assigned_ids if group_id not in set(removed_ids)
-            ]
-            supplement_count = target_count - len(removed_ids)
-            if supplement_count > 0 and remaining_ids:
-                removed_ids.extend(
-                    self._rng.sample(
-                        remaining_ids,
-                        min(supplement_count, len(remaining_ids)),
-                    )
-                )
-
-        logger.debug(
-            "Stage1 bay-pressure destroy: hotspot_areas=%s remove_count=%s",
-            sorted(hotspot_area_ids),
-            len(removed_ids),
-        )
-        return removed_ids
-
-    def _compute_bay_pressure_scores(
-        self,
-        solution: Stage1Solution,
-        context: Stage1CostContext,
-        yard_areas: List[YardArea],
-    ) -> Dict[str, float]:
-        workload_scores = self._compute_area_hotspot_scores(context, yard_areas)
-        group_ids_by_area: Dict[str, Set[str]] = defaultdict(set)
-        for group_id, placements in solution.placements_by_group.items():
-            for placement in placements:
-                group_ids_by_area[placement.area_id].add(group_id)
-
-        scores: Dict[str, float] = {}
-        for area in yard_areas:
-            state = context.states[area.area_id]
-            capacity = max(1, self._planning_capacity(area.area_id, context.states))
-            load_ratio = context.area_load.get(area.area_id, 0) / capacity
-            mix_pressure = len(state.locked_20_bays) + len(state.locked_large_bays)
-            if state.locked_20_bays and state.locked_large_bays:
-                mix_pressure += len(state.locked_20_bays) * len(state.locked_large_bays)
-            scores[area.area_id] = (
-                self.config.bay_pressure_workload_weight
-                * workload_scores.get(area.area_id, 0.0)
-                + self.config.bay_pressure_group_weight
-                * math.log1p(len(group_ids_by_area.get(area.area_id, set())))
-                + self.config.bay_pressure_load_ratio_weight * load_ratio
-                + self.config.bay_pressure_fragment_weight
-                * self._area_fragmentation_score(state)
-                + self.config.bay_pressure_mix_weight * mix_pressure
-            )
-        return scores
-
-    def _bay_pressure_group_boost(self, group: AllocationGroup) -> float:
-        if group.size == ContainerSize.SIZE_45:
-            size_boost = 1.4
-        elif group.size == ContainerSize.SIZE_40:
-            size_boost = 1.2
-        else:
-            size_boost = 1.0
-        if group.column_demand >= self.config.large_group_column_threshold:
-            size_boost *= self.config.bay_pressure_large_group_boost
-        return size_boost
 
     def _area_fragmentation_score(self, state: AreaResourceState) -> float:
         partial_20ft_bays = sum(
@@ -1332,113 +1139,10 @@ class Stage1YardAreaAssigner:
         )
         return float(partial_20ft_bays + partial_large_pairs)
 
-    def _compute_area_hotspot_scores(
-        self,
-        context: Stage1CostContext,
-        yard_areas: List[YardArea],
-    ) -> Dict[str, float]:
-        scores = {area.area_id: 0.0 for area in yard_areas}
-        by_business: Dict[BusinessType, List[YardArea]] = defaultdict(list)
-        for area in yard_areas:
-            by_business[area.business_type].append(area)
-
-        for business_type in (BusinessType.IMPORT, BusinessType.EXPORT):
-            areas = by_business.get(business_type, [])
-            if not areas:
-                continue
-            for area in areas:
-                soft_target = self._workload_area_soft_target(area.business_type)
-                for step_id, weight in self._iter_relevant_workload_steps():
-                    if weight <= 0.0:
-                        continue
-                    workload = self._area_step_workload(context, area.area_id, step_id)[2]
-                    excess = max(0.0, workload - soft_target)
-                    scores[area.area_id] += weight * (excess ** 2)
-        return scores
-
-    def _select_hotspot_area_ids(
-        self,
-        scores: Dict[str, float],
-        context: Stage1CostContext,
-        yard_areas: List[YardArea],
-    ) -> Set[str]:
-        hotspot_area_ids: Set[str] = set()
-        by_business: Dict[BusinessType, List[YardArea]] = defaultdict(list)
-        relevant_step_ids = [
-            step_id
-            for step_id, weight in self._iter_relevant_workload_steps()
-            if weight > 0.0
-        ]
-        for area in yard_areas:
-            by_business[area.business_type].append(area)
-
-        for business_type in (BusinessType.IMPORT, BusinessType.EXPORT):
-            areas_bt = by_business.get(business_type, [])
-            if not areas_bt:
-                continue
-            hotspot_count = max(1, min(self.config.hotspot_area_count, len(areas_bt)))
-            positive_areas = [
-                area for area in areas_bt if scores.get(area.area_id, 0.0) > 0.0
-            ]
-            if positive_areas:
-                ranked_areas = sorted(
-                    positive_areas,
-                    key=lambda area: (-scores.get(area.area_id, 0.0), area.area_id),
-                )
-            else:
-                raw_peak = {
-                    area.area_id: max(
-                        (
-                            self._area_step_workload(context, area.area_id, step_id)[2]
-                            for step_id in relevant_step_ids
-                        ),
-                        default=0.0,
-                    )
-                    for area in areas_bt
-                }
-                ranked_areas = sorted(
-                    areas_bt,
-                    key=lambda area: (-raw_peak.get(area.area_id, 0.0), area.area_id),
-                )
-            hotspot_area_ids.update(
-                area.area_id for area in ranked_areas[:hotspot_count]
-            )
-        return hotspot_area_ids
-
-    def _score_groups_on_hotspot_areas(
-        self,
-        solution: Stage1Solution,
-        group_by_id: Dict[str, AllocationGroup],
-        scores: Dict[str, float],
-        hotspot_area_ids: Set[str],
-    ) -> Dict[str, float]:
-        group_scores: Dict[str, float] = {}
-        for group_id, placements in solution.placements_by_group.items():
-            group = group_by_id.get(group_id)
-            if group is None:
-                group_scores[group_id] = 0.0
-                continue
-            placement_container_counts = self._placement_container_counts(group, placements)
-            group_score = 0.0
-            for placement, n_containers in zip(placements, placement_container_counts):
-                if placement.area_id not in hotspot_area_ids:
-                    continue
-                group_score += n_containers * scores.get(placement.area_id, 0.0)
-            group_scores[group_id] = group_score
-        return group_scores
-
     def _resolve_repair_operator(self) -> str:
         repair = (self.config.stage1_repair_operator or "auto").lower()
-        if repair == "adaptive":
-            return "adaptive"
-        if repair == "auto":
-            if self.config.stage1_destroy_operator == "bay_pressure":
-                return "stage2_guarded"
-            if self.config.stage1_destroy_operator == "workload_hotspot":
-                return "workload_balanced"
+        if repair in {"adaptive", "auto", "random"}:
             return "random"
-        if repair in {"random", "workload_balanced", "stage2_guarded"}:
-            return repair
         raise ValueError(f"未知 stage1_repair_operator: {self.config.stage1_repair_operator!r}")
 
     def _apply_repair_operator(
@@ -1450,21 +1154,7 @@ class Stage1YardAreaAssigner:
         operator: Optional[str] = None,
     ) -> Stage1Solution:
         op = (operator or self._resolve_repair_operator()).lower()
-        if op == "stage2_guarded":
-            return self._stage2_guarded_repair(
-                partial,
-                group_ids,
-                group_by_id,
-                yard_areas,
-            )
-        if op == "workload_balanced":
-            return self._workload_balanced_repair(
-                partial,
-                group_ids,
-                group_by_id,
-                yard_areas,
-            )
-        if op == "random":
+        if op in {"adaptive", "auto", "random"}:
             return self._random_repair(
                 partial,
                 group_ids,
@@ -1772,18 +1462,6 @@ class Stage1YardAreaAssigner:
             return float("inf")
         return sort_scores[1] - sort_scores[0]
 
-    def _effective_split_weight(self, group: AllocationGroup) -> float:
-        total_containers = max(1, group.container_count)
-        target = self._target_containers_per_area(group)
-        size_factor = min(1.0, target / total_containers)
-        if total_containers <= 100:
-            group_class_factor = 1.4
-        elif total_containers <= 300:
-            group_class_factor = 1.0
-        else:
-            group_class_factor = 0.7
-        return self.config.base_split_weight * size_factor * group_class_factor
-
     def _try_assign_group(
         self,
         partial: Stage1Solution,
@@ -1994,15 +1672,9 @@ class Stage1YardAreaAssigner:
                 )
                 if math.isinf(delta_cost):
                     continue
-                step_workload = self._area_step_workload(
-                    temp_context,
-                    area.area_id,
-                    self._primary_target_step_id(group),
-                )[2]
                 area_candidates.append(
                     (
                         delta_cost,
-                        step_workload,
                         temp_context.area_load.get(area.area_id, 0),
                         area.area_id,
                         preview,
@@ -2012,8 +1684,8 @@ class Stage1YardAreaAssigner:
             if not area_candidates:
                 return None
 
-            area_candidates.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
-            _delta_cost, _step_workload, _area_load, area_id, preview = area_candidates[0]
+            area_candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+            _delta_cost, _area_load, area_id, preview = area_candidates[0]
             temp_context.states[area_id].apply_preview(preview)
             temp_context.area_load[area_id] += part_columns
             temp_context.line_area_load[(group.line_key, area_id)] += part_columns
@@ -2039,18 +1711,6 @@ class Stage1YardAreaAssigner:
             placements=placements,
             previews=local_previews,
         )
-
-    def _primary_target_step_id(self, group: AllocationGroup) -> int:
-        if self.workload_snapshot is None:
-            return 0
-        target_step_ids = self.workload_snapshot.target_step_ids
-        if group.voyage_id in target_step_ids:
-            return target_step_ids[group.voyage_id]
-        if target_step_ids:
-            return next(iter(target_step_ids.values()))
-        if self._time_steps:
-            return self._time_steps[0].step_id
-        return 0
 
     @staticmethod
     def _balanced_column_demands(total_columns: int, part_count: int) -> List[int]:
@@ -2306,10 +1966,9 @@ class Stage1YardAreaAssigner:
         states = self._build_states(yard_areas)
         area_load: Dict[str, int] = defaultdict(int)
         line_area_load: Dict[Tuple[Optional[int], str], int] = defaultdict(int)
-        workload_overlay_raw: Dict[Tuple[str, int], List[float]] = defaultdict(
-            lambda: [0.0, 0.0]
-        )
         physical_cost = 0.0
+        berth_distance_cost = 0.0
+        busy_profile_cost = 0.0
         infeasible_count = 0
 
         for group_id, placements in solution.placements_by_group.items():
@@ -2317,16 +1976,12 @@ class Stage1YardAreaAssigner:
             if group is None:
                 infeasible_count += 1
                 continue
-            placement_container_counts = self._placement_container_counts(group, placements)
             group_infeasible = False
             if len(placements) > self.config.max_split_parts:
                 group_infeasible = True
             if sum(placement.column_demand for placement in placements) != group.column_demand:
                 group_infeasible = True
-            for placement, placement_container_count in zip(
-                placements,
-                placement_container_counts,
-            ):
+            for placement in placements:
                 if placement.column_demand <= 0:
                     group_infeasible = True
                     continue
@@ -2341,14 +1996,18 @@ class Stage1YardAreaAssigner:
                     continue
                 state.apply_preview(preview)
                 physical_cost += preview.physical_cost
+                berth_distance_cost += self._placement_berth_distance_cost(
+                    group,
+                    area,
+                    placement.column_demand,
+                )
+                busy_profile_cost += self._placement_busy_profile_cost(
+                    group,
+                    area,
+                    placement.column_demand,
+                )
                 area_load[placement.area_id] += placement.column_demand
                 line_area_load[(group.line_key, placement.area_id)] += placement.column_demand
-                self._accumulate_placement_container_overlay(
-                    workload_overlay_raw=workload_overlay_raw,
-                    group=group,
-                    placement=placement,
-                    n_containers=placement_container_count,
-                )
             if group_infeasible:
                 infeasible_count += 1
 
@@ -2360,10 +2019,9 @@ class Stage1YardAreaAssigner:
             states=states,
             area_load=area_load,
             line_area_load=line_area_load,
-            workload_overlay={
-                key: (value[0], value[1]) for key, value in workload_overlay_raw.items()
-            },
             physical_cost=physical_cost,
+            berth_distance_cost=berth_distance_cost,
+            busy_profile_cost=busy_profile_cost,
             infeasible_count=infeasible_count,
         )
 
@@ -2373,32 +2031,22 @@ class Stage1YardAreaAssigner:
         group: AllocationGroup,
         placement: Stage1Placement,
         preview: PlacementPreview,
-        n_containers: float,
     ) -> None:
         context.states[placement.area_id].apply_preview(preview)
         context.area_load[placement.area_id] += placement.column_demand
         context.line_area_load[(group.line_key, placement.area_id)] += placement.column_demand
         context.physical_cost += preview.physical_cost
-        if n_containers <= 0:
-            return
-        step_ids = self._voyage_step_span_for_group(group)
-        if not step_ids:
-            return
-        per_step_containers = n_containers / len(step_ids)
-        inbound_delta, outbound_delta = self._placement_container_move_delta(
+        area = self._area_by_id.get(placement.area_id)
+        context.berth_distance_cost += self._placement_berth_distance_cost(
             group,
-            per_step_containers,
+            area,
+            placement.column_demand,
         )
-        for step_id in step_ids:
-            key = (placement.area_id, step_id)
-            current_inbound, current_outbound = context.workload_overlay.get(
-                key,
-                (0.0, 0.0),
-            )
-            context.workload_overlay[key] = (
-                current_inbound + inbound_delta,
-                current_outbound + outbound_delta,
-            )
+        context.busy_profile_cost += self._placement_busy_profile_cost(
+            group,
+            area,
+            placement.column_demand,
+        )
 
     def _area_congestion_stats(
         self,
@@ -2430,20 +2078,11 @@ class Stage1YardAreaAssigner:
     ) -> float:
         del group_by_id, base_cost
         temp_context = context.clone()
-        placement_container_counts = self._placement_container_counts(
-            group,
-            candidate.placements,
-        )
-        step_id = self._primary_target_step_id(group)
-        soft_target = self._workload_area_soft_target(group.business_type)
-        workload_penalty = 0.0
-        underload_reward = 0.0
         physical_bias = 0.0
 
-        for placement, preview_entry, n_containers in zip(
+        for placement, preview_entry in zip(
             candidate.placements,
             candidate.previews,
-            placement_container_counts,
         ):
             _area_id, preview = preview_entry
             if preview is None:
@@ -2453,16 +2092,7 @@ class Stage1YardAreaAssigner:
                 group,
                 placement,
                 preview,
-                n_containers,
             )
-            workload = self._area_step_workload(
-                temp_context,
-                placement.area_id,
-                step_id,
-            )[2]
-            workload_penalty += max(0.0, workload - soft_target) ** 2
-            if workload < soft_target:
-                underload_reward += soft_target - workload
             physical_bias += preview.physical_cost
 
         group_count_by_area, load_ratio_by_area = self._area_congestion_stats(
@@ -2481,11 +2111,9 @@ class Stage1YardAreaAssigner:
         split_penalty = max(0, len(candidate.placements) - 1)
         return (
             candidate.delta_cost
-            + self.config.repair_workload_penalty_weight * workload_penalty
             + self.config.repair_physical_bias_weight * physical_bias
             + self.config.repair_congestion_weight * congestion_penalty
             + self.config.repair_split_bias_weight * split_penalty
-            - self.config.repair_underload_reward_weight * underload_reward
         )
 
     def _repair_tie_score(
@@ -2537,13 +2165,10 @@ class Stage1YardAreaAssigner:
         }
         temp_context = self._context_after_candidate(context, group, candidate)
         group_count_by_area = self._distinct_group_count_by_area(partial)
-        step_id = self._primary_target_step_id(group)
-        soft_target = self._workload_area_soft_target(group.business_type)
 
         competition_penalty = 0.0
         fragment_penalty = 0.0
         headroom_penalty = 0.0
-        workload_penalty = 0.0
         for area_id in affected_area_ids:
             state_after = temp_context.states[area_id]
             n_groups_after = group_count_by_area.get(area_id, 0) + 1
@@ -2554,8 +2179,6 @@ class Stage1YardAreaAssigner:
                 self._area_fragmentation_score(state_after)
                 - before_fragment.get(area_id, 0.0),
             )
-            workload = self._area_step_workload(temp_context, area_id, step_id)[2]
-            workload_penalty += max(0.0, workload - soft_target) ** 2
 
         for placement in candidate.placements:
             state_after = temp_context.states[placement.area_id]
@@ -2572,7 +2195,6 @@ class Stage1YardAreaAssigner:
             + self.config.guard_competition_weight * competition_penalty
             + self.config.guard_fragment_weight * fragment_penalty
             + self.config.guard_headroom_weight * headroom_penalty
-            + self.config.guard_workload_penalty_weight * workload_penalty
             + self.config.guard_split_weight * split_penalty
         )
 
@@ -2634,14 +2256,9 @@ class Stage1YardAreaAssigner:
         candidate: Stage1AssignmentCandidate,
     ) -> Stage1CostContext:
         temp_context = context.clone()
-        placement_container_counts = self._placement_container_counts(
-            group,
-            candidate.placements,
-        )
-        for placement, preview_entry, n_containers in zip(
+        for placement, preview_entry in zip(
             candidate.placements,
             candidate.previews,
-            placement_container_counts,
         ):
             _area_id, preview = preview_entry
             self._apply_preview_to_context(
@@ -2649,7 +2266,6 @@ class Stage1YardAreaAssigner:
                 group,
                 placement,
                 preview,
-                n_containers,
             )
         return temp_context
 
@@ -2787,161 +2403,20 @@ class Stage1YardAreaAssigner:
             remaining = max(0, remaining - count)
         return counts
 
-    def _accumulate_placement_container_overlay(
-        self,
-        *,
-        workload_overlay_raw: Dict[Tuple[str, int], List[float]],
-        group: AllocationGroup,
-        placement: Stage1Placement,
-        n_containers: float,
-    ) -> None:
-        if n_containers <= 0:
-            logger.debug(
-                "Stage1 workload overlay skipped: group=%s area=%s container_count=%s",
-                group.group_id,
-                placement.area_id,
-                n_containers,
-            )
-            return
-
-        step_ids = self._voyage_step_span_for_group(group)
-        if not step_ids:
-            return
-
-        per_step_containers = n_containers / len(step_ids)
-        for step_id in step_ids:
-            inbound_delta, outbound_delta = self._placement_container_move_delta(
-                group,
-                per_step_containers,
-            )
-            key = (placement.area_id, step_id)
-            workload_overlay_raw[key][0] += inbound_delta
-            workload_overlay_raw[key][1] += outbound_delta
-
-    def _voyage_step_span_for_group(self, group: AllocationGroup) -> List[int]:
-        if group.voyage_id in self._voyage_step_span:
-            return self._voyage_step_span[group.voyage_id]
-
-        vessel = self._vessels.get(group.voyage_id)
-        if vessel is None or not self._time_steps:
-            return []
-
-        eta = vessel.eta
-        # Fallback keeps grouping's latest departure semantics when ETD is absent,
-        # otherwise uses a conservative 48-hour in-yard window.
-        etd = vessel.etd or group.latest_departure or eta + timedelta(hours=48)
-        if etd <= eta:
-            etd = group.latest_departure or eta + timedelta(hours=48)
-
-        span: List[int] = []
-        for index, step in enumerate(self._time_steps):
-            is_last = index == len(self._time_steps) - 1
-            overlaps = step.start_time < etd and step.end_time > eta
-            if not overlaps and is_last and eta == step.end_time:
-                overlaps = True
-            if overlaps:
-                span.append(step.step_id)
-        self._voyage_step_span[group.voyage_id] = span
-        return span
-
-    def _time_step_workload_cost(
-        self,
-        context: Stage1CostContext,
-        yard_areas: List[YardArea],
-    ) -> float:
-        if self.workload_snapshot is None:
-            return 0.0
-        by_business: Dict[BusinessType, List[YardArea]] = defaultdict(list)
-        for area in yard_areas:
-            by_business[area.business_type].append(area)
-
-        total_cost = 0.0
-        for step_id, weight in self._iter_relevant_workload_steps():
-            if weight <= 0.0:
-                continue
-            for business_type in (BusinessType.IMPORT, BusinessType.EXPORT):
-                areas = by_business.get(business_type, [])
-                if not areas:
-                    continue
-                workloads = [
-                    self._area_step_workload(context, area.area_id, step_id)[2]
-                    for area in areas
-                ]
-                if not workloads:
-                    continue
-                soft_target = self._workload_area_soft_target(business_type)
-                overload = sum(
-                    max(0.0, workload - soft_target) ** 2 for workload in workloads
-                )
-                spread = max(workloads) - min(workloads)
-                total_cost += weight * self.config.workload_overload_weight * overload
-                total_cost += (
-                    weight
-                    * self.config.workload_balance_weight
-                    * self.config.workload_spread_weight_scale
-                    * spread
-                    * spread
-                )
-        return total_cost
-
-    def _workload_area_soft_target(self, business_type: BusinessType) -> float:
-        if business_type == BusinessType.EXPORT:
-            return max(1.0, self.config.workload_area_soft_target_export)
-        return max(1.0, self.config.workload_area_soft_target_import)
-
-    def _iter_relevant_workload_steps(self) -> List[Tuple[int, float]]:
-        if self.workload_snapshot is None:
-            return []
-        target_step_ids = set(self.workload_snapshot.target_step_ids.values())
-        if self.config.workload_use_target_eta_step_only:
-            return [(step_id, 1.0) for step_id in sorted(target_step_ids)]
-        return [
-            (
-                step.step_id,
-                1.0
-                if step.step_id in target_step_ids
-                else self.config.workload_non_target_step_weight,
-            )
-            for step in self.workload_snapshot.steps
-        ]
-
-    def _area_step_workload(
-        self,
-        context: Stage1CostContext,
-        area_id: str,
-        step_id: int,
-    ) -> Tuple[float, float, float, float]:
-        if self.workload_snapshot is None:
-            return 0.0, 0.0, 0.0, 0.0
-        base = self.workload_snapshot.by_area_step.get((area_id, step_id))
-        base_inbound = base.inbound_moves if base is not None else 0.0
-        base_outbound = base.outbound_moves if base is not None else 0.0
-        max_moves = (
-            base.max_moves
-            if base is not None
-            else self.workload_estimation_config.max_moves_per_step
-        )
-        overlay_inbound, overlay_outbound = context.workload_overlay.get(
-            (area_id, step_id),
-            (0.0, 0.0),
-        )
-        inbound = base_inbound + overlay_inbound
-        outbound = base_outbound + overlay_outbound
-        return inbound, outbound, inbound + outbound, max_moves
-
-    @staticmethod
-    def _placement_container_move_delta(
-        group: AllocationGroup,
-        n_containers: float,
-    ) -> Tuple[float, float]:
-        move_delta = float(max(0.0, n_containers))
-        if group.business_type == BusinessType.EXPORT:
-            return 0.3 * move_delta, 0.7 * move_delta
-        return 0.7 * move_delta, 0.3 * move_delta
-
     def _planning_capacity(self, area_id: str, states: Dict[str, AreaResourceState]) -> int:
         capacity = max(1, states[area_id].initial_total_columns)
-        return max(1, int(math.floor(capacity * self.config.workload_soft_capacity_ratio)))
+        area = self._area_by_id.get(area_id)
+        capacity_factor = self._area_busy_capacity_factor(area)
+        return max(
+            1,
+            int(
+                math.floor(
+                    capacity
+                    * self.config.workload_soft_capacity_ratio
+                    * capacity_factor
+                )
+            ),
+        )
 
     def _planning_remaining_capacity(
         self,
@@ -3049,27 +2524,6 @@ class Stage1YardAreaAssigner:
             return f"preview infeasible: {reason} ({count} areas)"
         return "split infeasible"
 
-    def _log_workload_balance(
-        self,
-        solution: Stage1Solution,
-        group_by_id: Dict[str, AllocationGroup],
-        yard_areas: List[YardArea],
-    ) -> None:
-        if self.workload_snapshot is None:
-            print("\n【Stage1】无工作量快照，跳过 ETA 时间步打印\n")
-            return
-        context = self._replay_solution(solution, group_by_id, yard_areas)
-        print_eta_step_workloads(
-            self.workload_snapshot,
-            yard_areas,
-            title="【Stage1 分配后】ETA 目标时间步 · 各箱区场桥工作量（箱次；计划箱数按 ETA～ETD 步数均摊）",
-            resolve_workload=lambda area_id, step_id: self._area_step_workload(
-                context,
-                area_id,
-                step_id,
-            ),
-        )
-
     def _line_concentration_cost(
         self,
         line_area_load: Dict[Tuple[Optional[int], str], int],
@@ -3104,51 +2558,59 @@ class Stage1YardAreaAssigner:
                     )
         return cost
 
-    def _group_dispersion_cost(
+    def _placement_berth_distance_cost(
         self,
-        solution: Stage1Solution,
-        group_by_id: Dict[str, AllocationGroup],
+        group: AllocationGroup,
+        area: Optional[YardArea],
+        column_demand: int,
     ) -> float:
-        cost = 0.0
-        min_part = max(1.0, float(self.config.min_split_part_containers))
-        for group_id, placements in solution.placements_by_group.items():
-            group = group_by_id.get(group_id)
-            if group is None or not placements:
-                continue
-            placement_counts = self._placement_container_counts(group, placements)
-            if not placement_counts:
-                continue
+        if area is None or column_demand <= 0:
+            return 0.0
+        area_coord = area.center_coordinate
+        vessel = self._vessels.get(group.voyage_id)
+        berth_coord = vessel.berth_coordinate if vessel is not None else None
+        if area_coord is None or berth_coord is None:
+            return 0.0
 
-            target = self._target_containers_per_area(group)
-            peak = max(placement_counts)
-            peak_excess_ratio = max(0.0, (peak - target) / target)
-            cost += self.config.group_peak_weight * peak_excess_ratio ** 2
-            if peak > target:
-                cost += self.config.group_peak_weight * 0.5 * (
-                    (peak - target) / max(1.0, group.container_count)
-                )
+        distance = math.hypot(
+            float(area_coord[0]) - float(berth_coord[0]),
+            float(area_coord[1]) - float(berth_coord[1]),
+        )
+        if vessel is not None:
+            area.distance_to_berth[vessel.voyage_id] = distance
+        return (distance / 1000.0) * float(column_demand)
 
-            if len(placements) > 1:
-                for count in placement_counts:
-                    fragment_ratio = max(0.0, (min_part - count) / min_part)
-                    cost += self.config.fragment_weight * fragment_ratio ** 2
-        return cost
+    @staticmethod
+    def _area_busy_capacity_factor(area: Optional[YardArea]) -> float:
+        if area is None or area.business_type != BusinessType.EXPORT:
+            return 1.0
+        factor = getattr(area, "_stage1_capacity_factor", 1.0)
+        try:
+            factor_value = float(factor)
+        except (TypeError, ValueError):
+            return 1.0
+        return min(1.0, max(0.2, factor_value))
 
-    def _split_operation_cost(
-        self,
-        solution: Stage1Solution,
-        group_by_id: Dict[str, AllocationGroup],
+    @staticmethod
+    def _placement_busy_profile_cost(
+        group: AllocationGroup,
+        area: Optional[YardArea],
+        column_demand: int,
     ) -> float:
-        cost = 0.0
-        for group_id, placements in solution.placements_by_group.items():
-            part_count = len(placements)
-            if part_count > 1:
-                group = group_by_id.get(group_id)
-                split_weight = self.config.split_weight
-                if group is not None:
-                    split_weight = self._effective_split_weight(group)
-                cost += split_weight * (part_count - 1) ** 2
-        return cost
+        if (
+            area is None
+            or column_demand <= 0
+            or group.business_type != BusinessType.EXPORT
+        ):
+            return 0.0
+        peak_busy_ratio = getattr(area, "_stage1_peak_busy_ratio", 0.0)
+        try:
+            peak = float(peak_busy_ratio)
+        except (TypeError, ValueError):
+            return 0.0
+        if peak <= 0.0:
+            return 0.0
+        return float(column_demand) * peak * peak
 
     def _target_containers_per_area(self, group: AllocationGroup) -> float:
         if group.business_type == BusinessType.EXPORT:
