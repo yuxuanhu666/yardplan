@@ -7,7 +7,6 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from yardplan_core.integrations import TOSLoader
 from yardplan_core.models import (
-    AllocationGroup,
     BusinessType,
     Container,
     PlannerMode,
@@ -61,8 +60,6 @@ def _apply_departed_loading_cleanup(
     yard: Any,
     vessels: Dict[str, Any],
     vessel_key: Optional[int],
-    plan_start_time: Optional[datetime],
-    plan_end_time: Optional[datetime],
 ) -> Dict[str, Any]:
     if vessel_key is None or len(vessels) != 1:
         return {
@@ -71,15 +68,13 @@ def _apply_departed_loading_cleanup(
         }
 
     target_vessel = next(iter(vessels.values()))
-    plan_made_at = target_vessel.eta - timedelta(days=4)
-    cleanup_start = plan_made_at
-    if plan_start_time is not None and plan_start_time > cleanup_start:
-        cleanup_start = plan_start_time
+    cleanup_start = target_vessel.eta - timedelta(days=4)
+    cleanup_end = target_vessel.eta
     cleanup_data = loader.load_departed_loading_container_ids(
         target_vessel_key=vessel_key,
         target_eta=target_vessel.eta,
         plan_start_time=cleanup_start,
-        plan_end_time=target_vessel.eta,
+        plan_end_time=cleanup_end,
     )
 
     container_ids = cleanup_data.get("container_ids", [])
@@ -118,9 +113,8 @@ def _apply_departed_loading_cleanup(
         "enabled": True,
         "targetVesselKey": vessel_key,
         "targetEta": target_vessel.eta.isoformat(),
-        "planMadeAt": plan_made_at.isoformat(),
         "cleanupStart": cleanup_start.isoformat(),
-        "cleanupEnd": target_vessel.eta.isoformat(),
+        "cleanupEnd": cleanup_end.isoformat(),
         "candidateVesselCount": len(candidate_vessels),
         "activeLoadingVesselCount": len(active_vessels),
         "containerCount": len(container_ids),
@@ -168,6 +162,8 @@ def _build_yard_busy_profile(
         }
         for index in range(bucket_count)
     ]
+    core_receiving_start = buckets[1]["start"]
+    core_receiving_end = buckets[2]["end"]
 
     wq_data = loader.load_loading_wq_containers_for_window(
         target_vessel_key=vessel_key,
@@ -175,8 +171,9 @@ def _build_yard_busy_profile(
         window_end=window_end,
     )
 
-    area_counts: Dict[str, List[int]] = defaultdict(lambda: [0] * bucket_count)
+    area_counts: Dict[str, List[float]] = defaultdict(lambda: [0.0] * bucket_count)
     area_busy_hours: Dict[str, List[float]] = defaultdict(lambda: [0.0] * bucket_count)
+    area_vessel_overlap_blocks: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     missing_container_count = 0
     vessels_with_loading = []
 
@@ -203,16 +200,35 @@ def _build_yard_busy_profile(
         if not block_counts:
             continue
 
-        visit_start = vessel.get("eta") or window_start
-        if visit_start < window_start:
-            visit_start = window_start
-        if visit_start >= window_end:
+        visit_start = vessel.get("eta")
+        visit_end = vessel.get("etd")
+        if visit_end is None:
             continue
+        overlaps_core_receiving = (
+            visit_start is not None
+            and visit_start < core_receiving_end
+            and visit_end > core_receiving_start
+        )
 
         for block_id, count in block_counts.items():
+            if overlaps_core_receiving:
+                area_vessel_overlap_blocks[block_id].append(
+                    {
+                        "vesselVisitKey": visit_key,
+                        "vesselVisitId": vessel.get("vesselVisitId"),
+                        "eta": visit_start.isoformat()
+                        if hasattr(visit_start, "isoformat")
+                        else visit_start,
+                        "etd": visit_end.isoformat()
+                        if hasattr(visit_end, "isoformat")
+                        else visit_end,
+                        "containerCount": count,
+                    }
+                )
+
             duration_hours = count / max(1e-6, moves_per_hour)
-            busy_start = visit_start
-            busy_end = busy_start + timedelta(hours=duration_hours)
+            busy_end = min(visit_end, window_end)
+            busy_start = max(window_start, busy_end - timedelta(hours=duration_hours))
             if busy_end <= busy_start:
                 continue
             for bucket in buckets:
@@ -222,7 +238,7 @@ def _build_yard_busy_profile(
                     continue
                 overlap_hours = (overlap_end - overlap_start).total_seconds() / 3600.0
                 index = bucket["index"]
-                area_counts[block_id][index] += count
+                area_counts[block_id][index] += count * overlap_hours / duration_hours
                 area_busy_hours[block_id][index] += overlap_hours
 
         vessels_with_loading.append(
@@ -242,39 +258,49 @@ def _build_yard_busy_profile(
         )
 
     areas: Dict[str, Dict[str, Any]] = {}
-    for block_id in sorted(area_busy_hours):
+    block_bucket_indices = (1, 2, 3)
+    hard_block_threshold = 0.3
+    vessel_overlap_hard_block_threshold = 0.2
+    for block_id in sorted(set(area_busy_hours) | set(area_vessel_overlap_blocks)):
         busy_hours = area_busy_hours[block_id]
         ratios = [min(1.0, hours / bucket_hours) for hours in busy_hours]
-        peak_ratio = max((ratios[index] for index in (1, 2)), default=0.0)
-        capacity_factor = max(0.0, 1.0 - peak_ratio)
-        hard_blocked = peak_ratio >= 0.45
+        peak_ratio = max(
+            (
+                ratios[index]
+                for index in block_bucket_indices
+                if index < len(ratios)
+            ),
+            default=0.0,
+        )
+        busy_ratio_blocked = peak_ratio > hard_block_threshold
+        overlap_blocks = area_vessel_overlap_blocks.get(block_id, [])
+        vessel_overlap_blocked = (
+            bool(overlap_blocks)
+            and peak_ratio > vessel_overlap_hard_block_threshold
+        )
+        planning_peak_ratio = peak_ratio
+        if overlap_blocks and peak_ratio <= vessel_overlap_hard_block_threshold:
+            planning_peak_ratio = 0.0
+        capacity_factor = max(0.0, 1.0 - planning_peak_ratio)
+        hard_blocked = busy_ratio_blocked or vessel_overlap_blocked
         areas[block_id] = {
-            "bucketContainerCounts": area_counts[block_id],
+            "bucketContainerCounts": [
+                round(value, 1) for value in area_counts[block_id]
+            ],
             "bucketBusyHours": [round(value, 3) for value in busy_hours],
             "bucketBusyRatios": [round(value, 4) for value in ratios],
             "peakBusyRatio": round(peak_ratio, 4),
+            "planningPeakBusyRatio": round(planning_peak_ratio, 4),
             "capacityFactor": round(capacity_factor, 4),
             "hardBlocked": hard_blocked,
+            "busyRatioBlocked": busy_ratio_blocked,
+            "vesselOverlapBlocked": vessel_overlap_blocked,
+            "vesselOverlapBlocks": overlap_blocks,
+            "hardBlockBucketIndices": list(block_bucket_indices),
+            "hardBlockThreshold": hard_block_threshold,
+            "vesselOverlapHardBlockThreshold": vessel_overlap_hard_block_threshold,
         }
 
-    top_areas = sorted(
-        areas.items(),
-        key=lambda item: item[1]["peakBusyRatio"],
-        reverse=True,
-    )[:10]
-
-    print("\n  箱区装船忙闲预测(日桶, 20箱/小时):")
-    print(f"    窗口: {window_start} -> {window_end}")
-    print(
-        f"    候选装船船舶: {len(wq_data.get('candidate_vessels', []))}  |  "
-        f"有装船箱且在堆场定位: {len(vessels_with_loading)}  |  未定位箱: {missing_container_count}"
-    )
-    if top_areas:
-        preview = ", ".join(
-            f"{block_id}(peak={profile['peakBusyRatio']:.2f})"
-            for block_id, profile in top_areas
-        )
-        print(f"    高峰冲突箱区Top: {preview}")
 
     return {
         "enabled": True,
@@ -295,6 +321,11 @@ def _build_yard_busy_profile(
         "areas": areas,
         "vessels": vessels_with_loading,
         "missingContainerCount": missing_container_count,
+        "hardBlockBucketIndices": list(block_bucket_indices),
+        "hardBlockThreshold": hard_block_threshold,
+        "vesselOverlapHardBlockThreshold": vessel_overlap_hard_block_threshold,
+        "coreReceivingStart": core_receiving_start.isoformat(),
+        "coreReceivingEnd": core_receiving_end.isoformat(),
     }
 
 
@@ -313,7 +344,7 @@ def run_plan(
     plan_end_time: Optional[datetime] = None,
     return_list: bool = False,
     print_score: bool = False,
-) -> Union[PlanningResult, List[Dict[str, Any]]]:
+) -> Union[PlanningResult, List[Dict[str, Any]], Dict[str, Any]]:
     """
     规划入口：传入一个或多个航线号，完成进出口箱堆场分配规划。
 
@@ -342,8 +373,6 @@ def run_plan(
     has_vessel_key = normalized_vessel_key is not None
     if has_line_keys == has_vessel_key:
         raise ValueError("Provide exactly one of line_keys or vessel_key")
-    if has_vessel_key and type != 1:
-        raise ValueError("vessel_key mode currently supports type=1 only")
 
     print("=" * 70)
     if has_vessel_key:
@@ -374,55 +403,70 @@ def run_plan(
     )
 
     containers: List[Container] = []
-    external_groups: List[AllocationGroup] = []
 
-    if type == 1:
-        import_containers = loader.load_discharge_containers(
-            line_keys=normalized_line_key,
-            vessel_key=normalized_vessel_key,
-            vessels=vessels,
+    import_containers = loader.load_discharge_containers(
+        line_keys=normalized_line_key,
+        vessel_key=normalized_vessel_key,
+        vessels=vessels,
+    )
+    export_containers = loader.load_loading_containers(
+        line_keys=normalized_line_key,
+        vessel_key=normalized_vessel_key,
+        vessels=vessels,
+    )
+    containers = import_containers + export_containers
+    if not containers:
+        logger.warning("未加载到任何进出口箱，规划终止")
+        return PlanningResult(
+            run_id="PLAN-EMPTY",
+            timestamp=datetime.now(),
+            mode=PlannerMode.FULL_PLAN,
         )
-        export_containers = loader.load_loading_containers(
-            line_keys=normalized_line_key,
-            vessel_key=normalized_vessel_key,
-            vessels=vessels,
-        )
-        containers = import_containers + export_containers
-        if not containers:
-            logger.warning("未加载到任何进出口箱，规划终止")
-            return PlanningResult(
-                run_id="PLAN-EMPTY",
-                timestamp=datetime.now(),
-                mode=PlannerMode.FULL_PLAN,
-            )
-        if has_vessel_key:
-            container_visit_ids = {container.voyage_id for container in containers}
-            vessels = {
-                visit_id: vessel
-                for visit_id, vessel in vessels.items()
-                if visit_id in container_visit_ids
-            }
-            horizon_start, horizon_end = loader.build_planning_horizon(
-                vessels,
-                plan_start_time=plan_start_time,
-                plan_end_time=plan_end_time,
-            )
-    else:
-        external_groups = loader.load_external_allocation_groups(
-            normalized_line_key,
+    if has_vessel_key:
+        container_visit_ids = {container.voyage_id for container in containers}
+        vessels = {
+            visit_id: vessel
+            for visit_id, vessel in vessels.items()
+            if visit_id in container_visit_ids
+        }
+        horizon_start, horizon_end = loader.build_planning_horizon(
             vessels,
+            plan_start_time=plan_start_time,
+            plan_end_time=plan_end_time,
         )
-        if not external_groups:
-            logger.warning("未加载到任何外部分配组，规划终止")
-            return PlanningResult(
-                run_id="PLAN-EMPTY",
-                timestamp=datetime.now(),
-                mode=PlannerMode.FULL_PLAN,
-            )
 
     from useable_space import YardSpace
 
-    yard = YardSpace.load()
+    yard = YardSpace.load(token=token)
+    if type == 2:
+        range_plan = loader.build_type2_space_allocation_plan(
+            containers=containers,
+            yard=yard,
+        )
+        result = PlanningResult(
+            run_id=f"PLAN-TYPE2-{datetime.now().strftime('%Y%m%d%H%M%S')}",
+            timestamp=datetime.now(),
+            mode=PlannerMode.FULL_PLAN,
+        )
+        result.metrics["range_plan"] = range_plan
+        result.metrics["data"] = range_plan.get("data", [])
+
+        changed_groups = range_plan.get("groupMap", {})
+        api_items = range_plan.get("data", [])
+        print(f"\n  type=2 groups with appended ranges: {len(changed_groups)}")
+        for group_key, group in list(changed_groups.items())[:20]:
+            ranges = group.get("rangeList") or []
+            print(
+                f"    groupKey={group_key} groupName={group.get('groupName')} "
+                f"rangeCount={len(ranges)}"
+            )
+        if len(changed_groups) > 20:
+            print(f"    ... total {len(changed_groups)} groups")
+
+        if return_list:
+            return api_items
+        return result
+
     yard_busy_profile = _build_yard_busy_profile(
         loader=loader,
         yard=yard,
@@ -434,8 +478,6 @@ def run_plan(
         yard=yard,
         vessels=vessels,
         vessel_key=normalized_vessel_key,
-        plan_start_time=plan_start_time,
-        plan_end_time=plan_end_time,
     )
     yard.print_summary()
 
@@ -453,31 +495,18 @@ def run_plan(
     }
 
     planner = YardPlanner()
-    if type == 1:
-        result = planner.plan_with_yard_space(
-            yard=yard,
-            containers=containers,
-            block_business_types=block_business_types,
-            vessels=vessels,
-            yard_busy_profile=yard_busy_profile,
-            mode=PlannerMode.FULL_PLAN,
-            apply_to_yard=apply_to_yard,
-            horizon_start=horizon_start,
-            horizon_end=horizon_end,
-            print_score=print_score,
-        )
-    else:
-        result = planner.plan_groups_with_yard_space(
-            yard=yard,
-            groups=external_groups,
-            block_business_types=block_business_types,
-            vessels=vessels,
-            mode=PlannerMode.FULL_PLAN,
-            apply_to_yard=apply_to_yard,
-            horizon_start=horizon_start,
-            horizon_end=horizon_end,
-            print_score=print_score,
-        )
+    result = planner.plan_with_yard_space(
+        yard=yard,
+        containers=containers,
+        block_business_types=block_business_types,
+        vessels=vessels,
+        yard_busy_profile=yard_busy_profile,
+        mode=PlannerMode.FULL_PLAN,
+        apply_to_yard=apply_to_yard,
+        horizon_start=horizon_start,
+        horizon_end=horizon_end,
+        print_score=print_score,
+    )
 
     result.metrics["yard_cleanup"] = cleanup_metrics
     result.metrics["yard_busy_profile"] = yard_busy_profile

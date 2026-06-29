@@ -195,6 +195,196 @@ class ResultFormatter:
 
         print("\n" + "=" * 80)
 
+    @staticmethod
+    def print_yard_busy_profile(
+        yard_busy_profile: Optional[Dict[str, Any]],
+        yard_areas: List[YardArea],
+    ) -> None:
+        if not yard_busy_profile or not yard_busy_profile.get("enabled"):
+            return
+
+        buckets = yard_busy_profile.get("buckets") or []
+        areas = yard_busy_profile.get("areas") or {}
+        bucket_headers = []
+        for bucket in buckets:
+            start = str(bucket.get("start") or "")[:10]
+            end = str(bucket.get("end") or "")[:10]
+            bucket_headers.append(f"{start}~{end}")
+
+        print("\n" + "=" * 108)
+        print("【WQ估算】规划前4天 · 按天桶的箱区忙闲程度")
+        print("=" * 108)
+        print(
+            f"窗口: {yard_busy_profile.get('windowStart')} ~ {yard_busy_profile.get('windowEnd')}"
+            f"  |  moves_per_hour={yard_busy_profile.get('movesPerHour')}"
+        )
+        print(
+            f"未定位WQ箱: {yard_busy_profile.get('missingContainerCount', 0)}"
+            f"  |  有WQ且可定位船舶: {len(yard_busy_profile.get('vessels') or [])}"
+        )
+        if bucket_headers:
+            print("日桶: " + " | ".join(f"D{idx}:{header}" for idx, header in enumerate(bucket_headers)))
+        hard_block_indices = yard_busy_profile.get("hardBlockBucketIndices") or [1, 2, 3]
+        hard_block_threshold = float(yard_busy_profile.get("hardBlockThreshold") or 0.3)
+        print(
+            "禁用规则: "
+            + "/".join(f"D{index}" for index in hard_block_indices)
+            + f" 任一忙闲比例 > {hard_block_threshold:.2f} 则 hardBlocked=True"
+        )
+        core_start = yard_busy_profile.get("coreReceivingStart")
+        core_end = yard_busy_profile.get("coreReceivingEnd")
+        if core_start and core_end:
+            vessel_overlap_threshold = float(
+                yard_busy_profile.get("vesselOverlapHardBlockThreshold") or 0.2
+            )
+            print(
+                f"船期重叠禁用: 其他船 ETA~ETD 与 {core_start} ~ {core_end} "
+                f"重叠且箱区忙闲比例 > {vessel_overlap_threshold:.2f} 时 hardBlocked=True"
+            )
+
+        area_rows: List[Dict[str, Any]] = []
+        for area in sorted(yard_areas, key=lambda item: item.area_id):
+            profile = areas.get(area.area_id) or {}
+            counts = list(profile.get("bucketContainerCounts") or [])
+            hours = list(profile.get("bucketBusyHours") or [])
+            ratios = list(profile.get("bucketBusyRatios") or [])
+            while len(counts) < 4:
+                counts.append(0)
+            while len(hours) < 4:
+                hours.append(0.0)
+            while len(ratios) < 4:
+                ratios.append(0.0)
+            area_rows.append(
+                {
+                    "area": area,
+                    "counts": counts,
+                    "hours": hours,
+                    "ratios": ratios,
+                    "peak": float(profile.get("peakBusyRatio") or 0.0),
+                    "capacity_factor": float(profile.get("capacityFactor") or 1.0),
+                    "hard_blocked": bool(profile.get("hardBlocked")),
+                    "busy_ratio_blocked": bool(profile.get("busyRatioBlocked")),
+                    "vessel_overlap_blocked": bool(
+                        profile.get("vesselOverlapBlocked")
+                    ),
+                    "vessel_overlap_blocks": list(
+                        profile.get("vesselOverlapBlocks") or []
+                    ),
+                }
+            )
+
+        busy_rows = [
+            row for row in area_rows if row["peak"] > 0.0 or row["hard_blocked"]
+        ]
+        if busy_rows:
+            print("\n阻塞峰值忙闲摘要(按peak降序):")
+            for row in sorted(
+                busy_rows,
+                key=lambda item: (-item["peak"], item["area"].area_id),
+            ):
+                print(
+                    f"{row['area'].area_id} "
+                    f"peak={row['peak']:.2f} "
+                    f"hardBlocked={row['hard_blocked']} "
+                    f"ratioBlocked={row['busy_ratio_blocked']} "
+                    f"vesselOverlapBlocked={row['vessel_overlap_blocked']} "
+                    f"capacityFactor={row['capacity_factor']:.2f}"
+                )
+                if row["vessel_overlap_blocks"]:
+                    preview = ", ".join(
+                        f"{item.get('vesselVisitId')}({item.get('containerCount')})"
+                        for item in row["vessel_overlap_blocks"][:5]
+                    )
+                    print(f"    overlapVessels: {preview}")
+
+        print(
+            f"{'箱区':<10} {'业态':<8} "
+            f"{'D0箱':>7} {'D0小时':>8} {'D0忙闲':>8} "
+            f"{'D1箱':>7} {'D1小时':>8} {'D1忙闲':>8} "
+            f"{'D2箱':>7} {'D2小时':>8} {'D2忙闲':>8} "
+            f"{'D3箱':>7} {'D3小时':>8} {'D3忙闲':>8} "
+            f"{'峰值':>8} {'硬阻塞':>8} {'原因':>14}"
+        )
+        print("-" * 148)
+
+        total_counts = [0, 0, 0, 0]
+        total_busy_hours = [0.0, 0.0, 0.0, 0.0]
+        for row in area_rows:
+            area = row["area"]
+            counts = row["counts"]
+            hours = row["hours"]
+            ratios = row["ratios"]
+            for index in range(4):
+                total_counts[index] += float(counts[index] or 0.0)
+                total_busy_hours[index] += float(hours[index] or 0.0)
+
+            business = "进口" if area.business_type == BusinessType.IMPORT else "出口"
+            reason = []
+            if row["busy_ratio_blocked"]:
+                reason.append("ratio")
+            if row["vessel_overlap_blocked"]:
+                reason.append("vessel")
+            print(
+                f"{area.area_id:<10} {business:<8} "
+                f"{float(counts[0]):7.1f} {float(hours[0]):8.2f} {float(ratios[0]):8.3f} "
+                f"{float(counts[1]):7.1f} {float(hours[1]):8.2f} {float(ratios[1]):8.3f} "
+                f"{float(counts[2]):7.1f} {float(hours[2]):8.2f} {float(ratios[2]):8.3f} "
+                f"{float(counts[3]):7.1f} {float(hours[3]):8.2f} {float(ratios[3]):8.3f} "
+                f"{row['peak']:8.3f} {str(row['hard_blocked']):>8} {','.join(reason):>14}"
+            )
+
+        bucket_hours = 24.0
+        total_ratios = [hours / bucket_hours for hours in total_busy_hours]
+        print("-" * 148)
+        print(
+            f"{'合计':<10} {'':<8} "
+            f"{total_counts[0]:7.1f} {total_busy_hours[0]:8.2f} {total_ratios[0]:8.3f} "
+            f"{total_counts[1]:7.1f} {total_busy_hours[1]:8.2f} {total_ratios[1]:8.3f} "
+            f"{total_counts[2]:7.1f} {total_busy_hours[2]:8.2f} {total_ratios[2]:8.3f} "
+            f"{total_counts[3]:7.1f} {total_busy_hours[3]:8.2f} {total_ratios[3]:8.3f} "
+            f"{max(total_ratios, default=0.0):8.3f} {'':>8}"
+        )
+
+        print("\n按时间桶展开(箱区按桶内忙闲比例降序):")
+        for index, bucket in enumerate(buckets[:4]):
+            start = str(bucket.get("start") or "")
+            end = str(bucket.get("end") or "")
+            print(f"\nD{index}  {start} ~ {end}")
+            print(
+                f"{'箱区':<10} {'业态':<8} {'WQ箱':>7} "
+                f"{'忙碌小时':>9} {'忙闲比例':>9} {'peak':>8} "
+                f"{'hardBlocked':>12} {'原因':>14}"
+            )
+            print("-" * 74)
+            for row in sorted(
+                area_rows,
+                key=lambda item: (
+                    -float(item["ratios"][index] or 0.0),
+                    -float(item["counts"][index] or 0.0),
+                    item["area"].area_id,
+                ),
+            ):
+                area = row["area"]
+                business = (
+                    "进口"
+                    if area.business_type == BusinessType.IMPORT
+                    else "出口"
+                )
+                reason = []
+                if row["busy_ratio_blocked"]:
+                    reason.append("ratio")
+                if row["vessel_overlap_blocked"]:
+                    reason.append("vessel")
+                print(
+                    f"{area.area_id:<10} {business:<8} "
+                    f"{float(row['counts'][index] or 0.0):7.1f} "
+                    f"{float(row['hours'][index] or 0.0):9.2f} "
+                    f"{float(row['ratios'][index] or 0.0):9.3f} "
+                    f"{row['peak']:8.3f} {str(row['hard_blocked']):>12} "
+                    f"{','.join(reason):>14}"
+                )
+        print("=" * 108 + "\n")
+
 
 class YardPlanner:
     """
@@ -218,6 +408,7 @@ class YardPlanner:
         mode: PlannerMode = PlannerMode.FULL_PLAN,
         horizon_start: Optional[datetime] = None,
         horizon_end: Optional[datetime] = None,
+        yard_busy_profile: Optional[Dict[str, Any]] = None,
         print_score: bool = False,
     ) -> PlanningResult:
         run_id = f"PLAN-{uuid.uuid4().hex[:12].upper()}"
@@ -253,6 +444,7 @@ class YardPlanner:
         self.rolling_planner.update_future_capacity(windows, yard_areas, [])
 
         groups = self.grouping_engine.group_containers(containers)
+        self.formatter.print_yard_busy_profile(yard_busy_profile, yard_areas)
         workload_snapshot = self.allocation_engine.stage1.build_workload_snapshot(
             yard_areas=yard_areas,
             time_steps=time_steps,
@@ -279,6 +471,7 @@ class YardPlanner:
         range_plan = self.formatter.build_range_plan(result)
         result.metrics["range_plan"] = range_plan
         result.metrics["data"] = range_plan["data"]
+        result.metrics["vessels"] = vessels or {}
 
         self.formatter.print_summary(result)
         if print_score:
@@ -286,6 +479,7 @@ class YardPlanner:
                 result,
                 yard_areas=yard_areas,
                 workload_snapshot=workload_snapshot,
+                vessels=vessels,
             )
             print(format_score_report(score, indent="  "))
         return result
@@ -298,6 +492,7 @@ class YardPlanner:
         mode: PlannerMode = PlannerMode.FULL_PLAN,
         horizon_start: Optional[datetime] = None,
         horizon_end: Optional[datetime] = None,
+        yard_busy_profile: Optional[Dict[str, Any]] = None,
         print_score: bool = False,
     ) -> PlanningResult:
         run_id = f"PLAN-{uuid.uuid4().hex[:12].upper()}"
@@ -324,6 +519,7 @@ class YardPlanner:
         windows = self.rolling_planner.generate_rolling_windows(time_steps)
         self.rolling_planner.update_future_capacity(windows, yard_areas, [])
 
+        self.formatter.print_yard_busy_profile(yard_busy_profile, yard_areas)
         workload_snapshot = self.allocation_engine.stage1.build_workload_snapshot(
             yard_areas=yard_areas,
             time_steps=time_steps,
@@ -349,6 +545,7 @@ class YardPlanner:
         range_plan = self.formatter.build_range_plan(result)
         result.metrics["range_plan"] = range_plan
         result.metrics["data"] = range_plan["data"]
+        result.metrics["vessels"] = vessels or {}
 
         self.formatter.print_summary(result)
         if print_score:
@@ -356,6 +553,7 @@ class YardPlanner:
                 result,
                 yard_areas=yard_areas,
                 workload_snapshot=workload_snapshot,
+                vessels=vessels,
             )
             print(format_score_report(score, indent="  "))
         return result
@@ -367,6 +565,7 @@ class YardPlanner:
         block_business_types: Dict[str, BusinessType],
         vessels: Optional[Dict[str, Vessel]] = None,
         block_ids: Optional[List[str]] = None,
+        yard_busy_profile: Optional[Dict[str, Any]] = None,
         mode: PlannerMode = PlannerMode.FULL_PLAN,
         apply_to_yard: bool = False,
         horizon_start: Optional[datetime] = None,
@@ -378,6 +577,7 @@ class YardPlanner:
             block_business_types,
             block_ids,
         )
+        self._attach_yard_busy_profile(yard_areas, yard_busy_profile)
         result = self.plan_groups(
             groups=groups,
             yard_areas=yard_areas,
@@ -385,6 +585,7 @@ class YardPlanner:
             mode=mode,
             horizon_start=horizon_start,
             horizon_end=horizon_end,
+            yard_busy_profile=yard_busy_profile,
             print_score=print_score,
         )
         if apply_to_yard:
@@ -434,6 +635,7 @@ class YardPlanner:
             mode=mode,
             horizon_start=horizon_start,
             horizon_end=horizon_end,
+            yard_busy_profile=yard_busy_profile,
             print_score=print_score,
         )
         if apply_to_yard:
@@ -457,7 +659,10 @@ class YardPlanner:
             if not profile:
                 continue
             area._stage1_busy_profile = profile
-            area._stage1_peak_busy_ratio = float(profile.get("peakBusyRatio") or 0.0)
+            area._stage1_peak_busy_ratio = float(
+                profile.get("planningPeakBusyRatio", profile.get("peakBusyRatio"))
+                or 0.0
+            )
             area._stage1_capacity_factor = float(profile.get("capacityFactor") or 1.0)
             area._stage1_hard_blocked = bool(profile.get("hardBlocked"))
 

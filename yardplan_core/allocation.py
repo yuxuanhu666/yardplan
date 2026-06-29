@@ -495,7 +495,7 @@ class AreaResourceState:
 class Stage1LNSConfig:
     """Tunable parameters actually used by stage-1 LNS."""
 
-    max_split_parts: int = 4
+    max_split_parts: int = 2
     large_group_column_threshold: int = 4
     max_iterations: int = 120
     no_improve_limit: int = 20
@@ -504,7 +504,7 @@ class Stage1LNSConfig:
     stage1_repair_operator: str = "random"
     random_seed: int = 17
     time_limit_seconds: Optional[float] = None
-    workload_provider: Optional[str] = "simulated"
+    workload_provider: Optional[str] = None
     workload_soft_capacity_ratio: float = 0.85
     line_small_fragment_weight: float = 5.0
     export_target_containers_per_area: int = 80
@@ -659,7 +659,11 @@ class Stage1YardAreaAssigner:
         self.scorer = scoring_strategy or DefaultAreaScoringStrategy()
         self.config = config or Stage1LNSConfig()
         self._rng = random.Random(self.config.random_seed)
-        self.workload_provider = workload_provider or self._resolve_workload_provider()
+        self.workload_provider: Optional[AreaWorkloadProvider] = (
+            workload_provider
+            if workload_provider is not None
+            else self._resolve_workload_provider()
+        )
         self.workload_estimation_config = (
             workload_estimation_config or WorkloadEstimationConfig()
         )
@@ -670,8 +674,10 @@ class Stage1YardAreaAssigner:
         self._voyage_step_span: Dict[str, List[int]] = {}
         self._last_search_summary: Dict[str, object] = {}
 
-    def _resolve_workload_provider(self) -> AreaWorkloadProvider:
-        provider_name = (self.config.workload_provider or "simulated").lower()
+    def _resolve_workload_provider(self) -> Optional[AreaWorkloadProvider]:
+        provider_name = (self.config.workload_provider or "").lower()
+        if not provider_name:
+            return None
         if provider_name == "simulated":
             return SimulatedAreaWorkloadProvider()
         raise ValueError(f"未知 workload_provider: {self.config.workload_provider!r}")
@@ -681,10 +687,8 @@ class Stage1YardAreaAssigner:
         snapshot: Optional[AreaWorkloadSnapshot],
     ) -> None:
         self.workload_snapshot = snapshot
-        if snapshot is None:
-            self._reset_workload_context()
-            return
-        self._time_steps = list(snapshot.steps)
+        if snapshot is not None:
+            self._time_steps = list(snapshot.steps)
 
     def build_workload_snapshot(
         self,
@@ -696,9 +700,9 @@ class Stage1YardAreaAssigner:
         plan_start_time: datetime,
         plan_end_time: datetime,
     ) -> Optional[AreaWorkloadSnapshot]:
-        if not time_steps:
+        self._cache_planning_context(vessels=vessels, time_steps=time_steps)
+        if not time_steps or self.workload_provider is None:
             self.workload_snapshot = None
-            self._reset_workload_context()
             return None
         workload_config = replace(
             self.workload_estimation_config,
@@ -714,7 +718,6 @@ class Stage1YardAreaAssigner:
             config=workload_config,
         )
         self.workload_snapshot = snapshot
-        self._cache_workload_context(vessels=vessels, time_steps=time_steps)
         return snapshot
 
     def _reset_workload_context(self) -> None:
@@ -722,7 +725,7 @@ class Stage1YardAreaAssigner:
         self._time_steps = []
         self._voyage_step_span = {}
 
-    def _cache_workload_context(
+    def _cache_planning_context(
         self,
         *,
         vessels: Dict[str, Vessel],
@@ -1073,12 +1076,21 @@ class Stage1YardAreaAssigner:
         solution: Stage1Solution,
         group_by_id: Dict[str, AllocationGroup],
         yard_areas: List[YardArea],
+        *,
+        enforce_vessel_area_min: bool = True,
     ) -> float:
         context = self._replay_solution(solution, group_by_id, yard_areas)
+        exceeds_vessel_area_max, vessel_area_deficit = self._vessel_area_count_violations(
+            solution,
+            group_by_id,
+            enforce_min=enforce_vessel_area_min,
+        )
+        if exceeds_vessel_area_max:
+            return float("inf")
+        context.infeasible_count += vessel_area_deficit
         cost = (context.infeasible_count + len(solution.unassigned_group_ids)) * self.config.unassigned_weight
         workload_cost = 0.0
         cost += workload_cost
-        cost += self._line_concentration_cost(context.line_area_load)
         cost += context.physical_cost * self.config.physical_weight
         cost += context.berth_distance_cost * self.config.berth_distance_weight
         cost += context.busy_profile_cost * self.config.busy_profile_weight
@@ -1095,7 +1107,11 @@ class Stage1YardAreaAssigner:
         base_cost: Optional[float] = None,
     ) -> float:
         del previews
-        before_cost = base_cost if base_cost is not None else self.evaluate(partial, group_by_id, yard_areas)
+        before_cost = (
+            base_cost
+            if base_cost is not None
+            else self.evaluate(partial, group_by_id, yard_areas)
+        )
         candidate = partial.clone()
         candidate.placements_by_group[group.group_id] = [
             Stage1Placement(p.group_id, p.area_id, p.column_demand) for p in placements
@@ -1534,7 +1550,7 @@ class Stage1YardAreaAssigner:
                 yard_areas,
                 base_cost=base_cost,
             )
-            if math.isinf(delta_cost):
+            if not math.isfinite(delta_cost):
                 continue
             full_candidates.append(
                 Stage1AssignmentCandidate(
@@ -1670,7 +1686,7 @@ class Stage1YardAreaAssigner:
                     yard_areas,
                     base_cost=base_cost,
                 )
-                if math.isinf(delta_cost):
+                if not math.isfinite(delta_cost):
                     continue
                 area_candidates.append(
                     (
@@ -1789,7 +1805,7 @@ class Stage1YardAreaAssigner:
                     yard_areas,
                     base_cost=base_cost,
                 )
-                if math.isinf(delta_cost):
+                if not math.isfinite(delta_cost):
                     continue
                 candidates.append((delta_cost, area.area_id, max_columns, preview))
 
@@ -2047,6 +2063,50 @@ class Stage1YardAreaAssigner:
             area,
             placement.column_demand,
         )
+
+    def _vessel_area_count_violations(
+        self,
+        solution: Stage1Solution,
+        group_by_id: Dict[str, AllocationGroup],
+        *,
+        enforce_min: bool,
+    ) -> Tuple[bool, int]:
+        if not self._vessels:
+            return False, 0
+
+        planned_voyages = {
+            group.voyage_id for group in group_by_id.values() if group.voyage_id
+        }
+        area_ids_by_voyage: Dict[str, Set[str]] = defaultdict(set)
+        for group_id, placements in solution.placements_by_group.items():
+            group = group_by_id.get(group_id)
+            if group is None or not group.voyage_id:
+                continue
+            for placement in placements:
+                if placement.area_id:
+                    area_ids_by_voyage[group.voyage_id].add(placement.area_id)
+
+        exceeds_max = False
+        min_deficit = 0
+        for voyage_id in planned_voyages:
+            vessel = self._vessels.get(voyage_id)
+            if vessel is None:
+                continue
+            try:
+                eqp_num = int(getattr(vessel, "eqp_num", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if eqp_num <= 0:
+                continue
+
+            area_count = len(area_ids_by_voyage.get(voyage_id, set()))
+            min_areas = eqp_num
+            max_areas = eqp_num + 2
+            if area_count > max_areas:
+                exceeds_max = True
+            if enforce_min and area_count < min_areas:
+                min_deficit += min_areas - area_count
+        return exceeds_max, min_deficit
 
     def _area_congestion_stats(
         self,

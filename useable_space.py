@@ -14,9 +14,11 @@
 """
 
 import json
+import importlib
 import os
 import time
 from collections import defaultdict
+from typing import Any, Callable, Optional
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".", "data")
 
@@ -69,7 +71,7 @@ class YardSpace:
     # ================================================================
 
     @classmethod
-    def load(cls, name_index_path=None, space_current_path=None):
+    def load(cls, name_index_path=None, space_current_path=None, token=None):
         """
         从文件创建 YardSpace。
 
@@ -79,17 +81,136 @@ class YardSpace:
         space_current_path : 默认 DATA_DIR/spaceCurrent.json, 传 None 则初始化空堆场
         """
         yard = cls()
-        yard._load_topology(name_index_path or os.path.join(DATA_DIR, "nameIndex.json"))
+        name_index_path = name_index_path or os.path.join(DATA_DIR, "nameIndex.json")
+        name_index_raw = yard._load_json_data(
+            "name_index",
+            name_index_path,
+            expected_type=dict,
+            required_key="yardNameIndexMap",
+        )
+        yard._load_topology(name_index_path, raw=name_index_raw)
         if space_current_path is not False:
-            yard._load_containers(space_current_path or os.path.join(DATA_DIR, "spaceCurrent.json"))
+            space_current_path = space_current_path or os.path.join(DATA_DIR, "getSpaceCurrent_new.json")
+            space_current_raw = yard._load_json_data(
+                "space_current",
+                space_current_path,
+                token=token,
+                dynamic_func_name="SpaceCurrent_receive",
+                expected_type=dict,
+                required_key="containerMap",
+            )
+            yard._load_containers(space_current_path, raw=space_current_raw)
         yard._rebuild_all_stacks()
         return yard
 
-    def _load_topology(self, path):
+    def _load_json_data(
+        self,
+        data_name: str,
+        static_path: str,
+        *,
+        token: Optional[Any] = None,
+        dynamic_func_name: Optional[str] = None,
+        expected_type: Optional[type] = None,
+        required_key: Optional[str] = None,
+    ) -> Any:
+        dynamic_reason = ""
+        if dynamic_func_name and token:
+            try:
+                raw = self._call_url_receive(dynamic_func_name, token)
+                raw = self._normalize_loaded_payload(
+                    raw,
+                    expected_type=expected_type,
+                    required_key=required_key,
+                )
+                self._validate_loaded_payload(
+                    data_name,
+                    raw,
+                    expected_type=expected_type,
+                    required_key=required_key,
+                )
+                self._log_data_source(data_name, "dynamic", dynamic_func_name)
+                return raw
+            except Exception as exc:
+                dynamic_reason = f"; dynamic failed: {exc}"
+        elif dynamic_func_name:
+            dynamic_reason = "; dynamic skipped: no token"
+
+        try:
+            with open(static_path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"failed to load static {data_name}: {static_path}") from exc
+
+        raw = self._normalize_loaded_payload(
+            raw,
+            expected_type=expected_type,
+            required_key=required_key,
+        )
+        self._validate_loaded_payload(
+            data_name,
+            raw,
+            expected_type=expected_type,
+            required_key=required_key,
+        )
+        detail = static_path if not dynamic_reason else f"{static_path}{dynamic_reason}"
+        self._log_data_source(data_name, "static", detail)
+        return raw
+
+    @staticmethod
+    def _call_url_receive(function_name: str, token: Any) -> Any:
+        try:
+            url_receive = importlib.import_module("yardplan_core.URL_Receive")
+        except ModuleNotFoundError as exc:
+            if exc.name != "yardplan_core.URL_Receive":
+                raise
+            url_receive = importlib.import_module("URL_Receive")
+
+        receiver: Callable[[Any], Any] = getattr(url_receive, function_name)
+        return receiver(token)
+
+    @staticmethod
+    def _normalize_loaded_payload(
+        raw: Any,
+        *,
+        expected_type: Optional[type],
+        required_key: Optional[str],
+    ) -> Any:
+        if expected_type is list and isinstance(raw, dict):
+            data = raw.get("data")
+            if isinstance(data, list):
+                return data
+        if expected_type is dict and required_key and isinstance(raw, dict):
+            if required_key not in raw:
+                data = raw.get("data")
+                if isinstance(data, dict) and required_key in data:
+                    return data
+        return raw
+
+    @staticmethod
+    def _validate_loaded_payload(
+        data_name: str,
+        raw: Any,
+        *,
+        expected_type: Optional[type],
+        required_key: Optional[str],
+    ) -> None:
+        if expected_type is not None and not isinstance(raw, expected_type):
+            raise ValueError(
+                f"{data_name} expected {expected_type.__name__}, got {type(raw).__name__}"
+            )
+        if required_key and isinstance(raw, dict) and required_key not in raw:
+            raise ValueError(f"{data_name} missing required key {required_key!r}")
+
+    @staticmethod
+    def _log_data_source(data_name: str, source: str, detail: str) -> None:
+        print(f"[DATA] {data_name}: {source} ({detail})")
+
+    def _load_topology(self, path, raw=None):
         print("正在加载 nameIndex.json (解析槽位拓扑) ...")
         t0 = time.time()
-        with open(path, "r", encoding="utf-8") as f:
-            raw = json.load(f)
+        if raw is None:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
         print(f"  JSON 解析耗时 {time.time() - t0:.1f}s")
 
         yard_map = raw.get("yardNameIndexMap", {})
@@ -127,11 +248,12 @@ class YardSpace:
         del yard_map
         print(f"  20尺槽位: {len(self.slots_20ft):,}  |  40尺槽位: {len(self.slots_40ft):,}")
 
-    def _load_containers(self, path):
+    def _load_containers(self, path, raw=None):
         print("正在加载 spaceCurrent.json (解析箱子占位) ...")
         t0 = time.time()
-        with open(path, "r", encoding="utf-8") as f:
-            raw = json.load(f)
+        if raw is None:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
         print(f"  JSON 解析耗时 {time.time() - t0:.1f}s")
 
         container_map = raw.get("containerMap", {})

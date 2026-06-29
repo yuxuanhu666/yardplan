@@ -186,28 +186,39 @@ class Stage2PlacementOption:
     stack_index: int
     zone: str
     rank: int
+    segment_capacity: int = 1
+    segment_scarcity_cost: float = 0.0
 
 
 @dataclass
 class Stage2ScipConfig:
-    time_limit_seconds: float = 60.0
+    time_limit_seconds: float = 120.0
     unmet_weight: float = 1_000_000.0
     segment_weight: float = 1_000.0
     region_component_weight: float = 1_500.0
-    # These layout-shape rules are useful for prettier blocks, but making them
-    # hard by default can leave boxes unmet even when physical slots exist.
-    enforce_stack_contiguity: bool = False
+    # Each planned space should be compact: stacks must be contiguous within one
+    # bay, and a continuing bay run must fill the previous bay before opening the
+    # adjacent one.  We still allow multiple bay runs for one group when the yard
+    # has unavoidable gaps; each run then has at most one underfilled tail bay.
+    enforce_stack_contiguity: bool = True
     segment_min_fill_ratio: float = 0.65
     max_underfilled_segments_per_item: int = 2
     # Crane balance should only be a weak tie-breaker; it must not tear apart
     # a physically feasible contiguous parent-group block.
     crane_balance_weight: float = 1.0
     stability_weight: float = 0.001
+    # Break stack-symmetry inside the same bay/pair: when two shapes are equally
+    # compact, prefer lower stack indices so an empty bay is filled from column 1.
+    stack_position_weight: float = 5.0
+    # Prefer bays/pairs with more remaining empty columns. A nearly full bay is
+    # still usable when necessary, but it should lose to a wider empty bay.
+    segment_scarcity_weight: float = 250.0
     enforce_bay_run_contiguity: bool = False
-    enforce_sequential_segment_fill: bool = False
+    enforce_sequential_segment_fill: bool = True
     enforce_segment_min_fill: bool = False
     stack_run_weight: float = 600.0
     isolated_cell_weight: float = 800.0
+    underfilled_segment_weight: float = 2_500.0
     soft_geometric_region_axis: bool = True
 
 
@@ -368,6 +379,7 @@ class ScipStage2BayAllocator:
         region_start_terms: List[Any] = []
         stack_run_terms: List[Any] = []
         isolated_cell_terms: List[Any] = []
+        underfilled_segment_terms: List[Any] = []
         if self.config.enforce_stack_contiguity:
             self._add_stack_contiguity_constraints(model, segment_stack_vars)
         if self.config.enforce_segment_min_fill:
@@ -399,6 +411,13 @@ class ScipStage2BayAllocator:
                 item_segments,
                 item_keys,
                 isolated_cell_terms,
+            )
+        if self.config.underfilled_segment_weight > 0:
+            self._add_soft_underfilled_segment_constraints(
+                model,
+                segment_stack_vars,
+                item_segments,
+                underfilled_segment_terms,
             )
         self._add_segment_activation_constraints(
             model,
@@ -444,6 +463,8 @@ class ScipStage2BayAllocator:
         load_a_terms: List[Any] = []
         load_b_terms: List[Any] = []
         stability_terms: List[Any] = []
+        stack_position_terms: List[Any] = []
+        segment_scarcity_terms: List[Any] = []
         for (item_key, option_id), var in x.items():
             option = option_lookup[option_id]
             if option.zone == "A":
@@ -451,6 +472,8 @@ class ScipStage2BayAllocator:
             else:
                 load_b_terms.append(var)
             stability_terms.append(float(option.rank) * var)
+            stack_position_terms.append(float(max(0, option.stack_index - 1)) * var)
+            segment_scarcity_terms.append(float(option.segment_scarcity_cost) * var)
 
         load_a = quicksum(load_a_terms) if load_a_terms else 0
         load_b = quicksum(load_b_terms) if load_b_terms else 0
@@ -464,8 +487,11 @@ class ScipStage2BayAllocator:
             + self.config.region_component_weight * quicksum(region_start_terms)
             + self.config.stack_run_weight * quicksum(stack_run_terms)
             + self.config.isolated_cell_weight * quicksum(isolated_cell_terms)
+            + self.config.underfilled_segment_weight * quicksum(underfilled_segment_terms)
             + self.config.crane_balance_weight * balance
             + self.config.stability_weight * quicksum(stability_terms)
+            + self.config.stack_position_weight * quicksum(stack_position_terms)
+            + self.config.segment_scarcity_weight * quicksum(segment_scarcity_terms)
         )
         model.setObjective(objective, "minimize")
         model.optimize()
@@ -737,6 +763,45 @@ class ScipStage2BayAllocator:
             region_start_terms,
         )
 
+    def _add_soft_underfilled_segment_constraints(
+        self,
+        model: Any,
+        segment_stack_vars: Dict[Tuple[str, BaySpec], Dict[int, Any]],
+        item_segments: Dict[str, Dict[BaySpec, Any]],
+        underfilled_segment_terms: List[Any],
+    ) -> None:
+        """
+        Penalize active bays/pairs that are not filled to their available width.
+
+        The hard sequential-fill constraint already guarantees that a bay run can
+        only continue after the previous segment is full. This soft term makes the
+        solver prefer one full bay plus one tail over several one-bay tails, while
+        still allowing tail mixing when a group's remaining demand cannot fill a
+        whole bay.
+        """
+        for (item_key, segment), stack_vars in segment_stack_vars.items():
+            segment_var = item_segments.get(item_key, {}).get(segment)
+            if segment_var is None or not stack_vars:
+                continue
+
+            capacity = len(stack_vars)
+            if capacity <= 1:
+                continue
+            underfilled = model.addVar(
+                vtype="B",
+                name=f"underfilled_seg_{item_key}_{self._segment_name(segment)}",
+            )
+            fill_expr = sum(stack_vars.values())
+            model.addCons(
+                fill_expr + capacity * underfilled >= capacity * segment_var,
+                name=f"underfilled_link_{item_key}_{self._segment_name(segment)}",
+            )
+            model.addCons(
+                underfilled <= segment_var,
+                name=f"underfilled_active_{item_key}_{self._segment_name(segment)}",
+            )
+            underfilled_segment_terms.append(underfilled)
+
     def _add_region_start_constraints(
         self,
         model: Any,
@@ -929,11 +994,20 @@ class ScipStage2BayAllocator:
         existing_20ft_bays = set(getattr(area, "_stage2_existing_20ft_bays", set()))
         existing_large_bays = set(getattr(area, "_stage2_existing_large_bays", set()))
 
-        for rank, slot in enumerate(self._single_slots(area)):
+        single_slots: List[Dict[str, int]] = []
+        single_capacity_by_bay: Dict[int, int] = defaultdict(int)
+        for slot in self._single_slots(area):
             bay = int(slot["bay_number"])
             if bay in existing_large_bays:
                 continue
+            single_slots.append(slot)
+            single_capacity_by_bay[bay] += 1
+        max_single_capacity = max(single_capacity_by_bay.values(), default=1)
+
+        for rank, slot in enumerate(single_slots):
+            bay = int(slot["bay_number"])
             stack = int(slot["stack_index"])
+            segment_capacity = max(1, single_capacity_by_bay.get(bay, 0))
             options[ContainerSize.SIZE_20].append(
                 Stage2PlacementOption(
                     option_id=f"s20_{bay}_{stack}",
@@ -942,20 +1016,32 @@ class ScipStage2BayAllocator:
                     stack_index=stack,
                     zone=zone_by_bay.get(bay, "B"),
                     rank=rank,
+                    segment_capacity=segment_capacity,
+                    segment_scarcity_cost=max(0.0, float(max_single_capacity - segment_capacity)),
                 )
             )
 
-        large_slots = self._large_slots(area)
-        for rank, slot in enumerate(large_slots):
+        large_slots: List[Dict[str, Any]] = []
+        large_capacity_by_segment: Dict[BaySpec, int] = defaultdict(int)
+        for slot in self._large_slots(area):
             bay_numbers = tuple(int(value) for value in slot["bay_numbers"])
             if set(bay_numbers) & existing_20ft_bays:
                 continue
             if set(bay_numbers) & existing_large_bays:
                 continue
             display_bays = tuple(int(value) for value in slot.get("display_bays", bay_numbers))
+            large_slots.append(slot)
+            large_capacity_by_segment[display_bays] += 1
+        max_large_capacity = max(large_capacity_by_segment.values(), default=1)
+
+        for rank, slot in enumerate(large_slots):
+            bay_numbers = tuple(int(value) for value in slot["bay_numbers"])
+            display_bays = tuple(int(value) for value in slot.get("display_bays", bay_numbers))
             stack = int(slot["stack_index"])
             atoms = tuple((bay, stack) for bay in bay_numbers)
             zone = self._option_zone(bay_numbers, zone_by_bay)
+            segment_capacity = max(1, large_capacity_by_segment.get(display_bays, 0))
+            segment_scarcity_cost = max(0.0, float(max_large_capacity - segment_capacity))
             option = Stage2PlacementOption(
                 option_id=f"l40_{display_bays[0]}_{display_bays[1]}_{stack}_{rank}",
                 bay_spec=display_bays,
@@ -963,6 +1049,8 @@ class ScipStage2BayAllocator:
                 stack_index=stack,
                 zone=zone,
                 rank=rank,
+                segment_capacity=segment_capacity,
+                segment_scarcity_cost=segment_scarcity_cost,
             )
             options[ContainerSize.SIZE_40].append(option)
             if bool(slot.get("is_edge_pair")):
@@ -974,6 +1062,8 @@ class ScipStage2BayAllocator:
                         stack_index=stack,
                         zone=zone,
                         rank=rank,
+                        segment_capacity=segment_capacity,
+                        segment_scarcity_cost=segment_scarcity_cost,
                     )
                 )
 

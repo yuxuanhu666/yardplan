@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import importlib
 import os
+from copy import deepcopy
 from collections import defaultdict
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from yardplan_core.models import (
     _DATA_DIR,
@@ -416,34 +418,196 @@ class TOSLoader:
         berth_plan_path: Optional[str] = None,
         berth_data_path: Optional[str] = None,
         wq_path: Optional[str] = None,
+        space_allocation_path: Optional[str] = None,
         token: Optional[str] = None,
     ):
         self.token = token
         self.vessel_visit_path = vessel_visit_path or os.path.join(
             _DATA_DIR,
-            "217getVesselVisit（船舶访问计划）.json",
+            "getVesselVisit_new.json",
         )
         self.bound_list_path = bound_list_path or os.path.join(
             _DATA_DIR,
-            "217getBoundList（装船箱和卸船箱列表）.json",
+            "getBoundList _new.json",
         )
 
         self.berth_plan_path = berth_plan_path or os.path.join(
             _DATA_DIR,
-            "berthplan泊位计划.json",
+            "berthplan.json",
         )
         self.berth_data_path = berth_data_path or os.path.join(
             _DATA_DIR,
-            "217泊位数据.json",
+            "berthdata.json",
         )
 
         self.wq_path = wq_path or os.path.join(_DATA_DIR, "217_WQ.json")
+        self.space_allocation_path = space_allocation_path or os.path.join(
+            _DATA_DIR,
+            "getSpcaeAllocation(堆存计划范围).json",
+        )
+        self._json_cache: Dict[str, Any] = {}
+
+    def _load_json_data(
+        self,
+        data_name: str,
+        static_path: str,
+        *,
+        dynamic_func_name: Optional[str] = None,
+        expected_type: Optional[type] = None,
+        required_key: Optional[str] = None,
+    ) -> Any:
+        if data_name in self._json_cache:
+            return self._json_cache[data_name]
+
+        dynamic_reason = ""
+        if dynamic_func_name and self.token:
+            try:
+                raw = self._call_url_receive(dynamic_func_name)
+                raw = self._normalize_loaded_payload(
+                    raw,
+                    expected_type=expected_type,
+                    required_key=required_key,
+                )
+                self._validate_loaded_payload(
+                    data_name,
+                    raw,
+                    expected_type=expected_type,
+                    required_key=required_key,
+                )
+                self._json_cache[data_name] = raw
+                self._log_data_source(data_name, "dynamic", dynamic_func_name)
+                return raw
+            except Exception as exc:
+                dynamic_reason = f"; dynamic failed: {exc}"
+        elif dynamic_func_name:
+            dynamic_reason = "; dynamic skipped: no token"
+
+        try:
+            with open(static_path, "r", encoding="utf-8") as file:
+                raw = json.load(file)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"failed to load static {data_name}: {static_path}") from exc
+
+        raw = self._normalize_loaded_payload(
+            raw,
+            expected_type=expected_type,
+            required_key=required_key,
+        )
+        self._validate_loaded_payload(
+            data_name,
+            raw,
+            expected_type=expected_type,
+            required_key=required_key,
+        )
+        self._json_cache[data_name] = raw
+        detail = static_path if not dynamic_reason else f"{static_path}{dynamic_reason}"
+        self._log_data_source(data_name, "static", detail)
+        return raw
+
+    def _call_url_receive(self, function_name: str) -> Any:
+        try:
+            url_receive = importlib.import_module("yardplan_core.URL_Receive")
+        except ModuleNotFoundError as exc:
+            if exc.name != "yardplan_core.URL_Receive":
+                raise
+            url_receive = importlib.import_module("URL_Receive")
+
+        receiver: Callable[[Any], Any] = getattr(url_receive, function_name)
+        return receiver(self.token)
+
+    @staticmethod
+    def _normalize_loaded_payload(
+        raw: Any,
+        *,
+        expected_type: Optional[type],
+        required_key: Optional[str],
+    ) -> Any:
+        if expected_type is list and isinstance(raw, dict):
+            data = raw.get("data")
+            if isinstance(data, list):
+                return data
+        if expected_type is dict and required_key and isinstance(raw, dict):
+            if required_key not in raw:
+                data = raw.get("data")
+                if isinstance(data, dict) and required_key in data:
+                    return data
+        return raw
+
+    @staticmethod
+    def _validate_loaded_payload(
+        data_name: str,
+        raw: Any,
+        *,
+        expected_type: Optional[type],
+        required_key: Optional[str],
+    ) -> None:
+        if expected_type is not None and not isinstance(raw, expected_type):
+            raise ValueError(
+                f"{data_name} expected {expected_type.__name__}, got {type(raw).__name__}"
+            )
+        if required_key and isinstance(raw, dict) and required_key not in raw:
+            raise ValueError(f"{data_name} missing required key {required_key!r}")
+
+    @staticmethod
+    def _log_data_source(data_name: str, source: str, detail: str) -> None:
+        message = f"[DATA] {data_name}: {source} ({detail})"
+        print(message)
+        logger.info(message)
+
+    def _load_vessel_visit_json(self) -> List[dict]:
+        return self._load_json_data(
+            "vessel_visit",
+            self.vessel_visit_path,
+            dynamic_func_name="ShipVisitList_receive",
+            expected_type=list,
+        )
+
+    def _load_bound_list_json(self) -> Dict[str, Any]:
+        return self._load_json_data(
+            "bound_list",
+            self.bound_list_path,
+            dynamic_func_name="BoundList_receive",
+            expected_type=dict,
+            required_key="Outbound",
+        )
+
+    def _load_wq_json(self) -> Dict[str, Any]:
+        return self._load_json_data(
+            "wq",
+            self.wq_path,
+            dynamic_func_name="WqByVesselVisit_receive",
+            expected_type=dict,
+        )
+
+    def _load_berth_plan_json(self) -> Dict[str, Any]:
+        return self._load_json_data(
+            "berth_plan",
+            self.berth_plan_path,
+            dynamic_func_name="berthplan_receive",
+            expected_type=dict,
+        )
+
+    def _load_berth_data_json(self) -> Dict[str, Any]:
+        return self._load_json_data(
+            "berth_data",
+            self.berth_data_path,
+            expected_type=dict,
+            required_key="berthMap",
+        )
+
+    def _load_space_allocation_json(self) -> Dict[str, Any]:
+        return self._load_json_data(
+            "space_allocation",
+            self.space_allocation_path,
+            dynamic_func_name="SpaceAllocation_receive",
+            expected_type=dict,
+            required_key="groupMap",
+        )
 
     def _load_berth_plans_by_visit_key(self) -> Dict[int, Dict[str, Any]]:
         try:
-            with open(self.berth_plan_path, "r", encoding="utf-8") as file:
-                raw = json.load(file)
-        except (OSError, json.JSONDecodeError) as exc:
+            raw = self._load_berth_plan_json()
+        except ValueError as exc:
             logger.warning("TOSLoader: failed to load berth plans: %s", exc)
             return {}
 
@@ -460,9 +624,8 @@ class TOSLoader:
 
     def _load_berth_centers(self) -> Dict[int, Tuple[float, float]]:
         try:
-            with open(self.berth_data_path, "r", encoding="utf-8") as file:
-                raw = json.load(file)
-        except (OSError, json.JSONDecodeError) as exc:
+            raw = self._load_berth_data_json()
+        except ValueError as exc:
             logger.warning("TOSLoader: failed to load berth data: %s", exc)
             return {}
 
@@ -510,9 +673,8 @@ class TOSLoader:
             return empty_result
 
         try:
-            with open(self.vessel_visit_path, "r", encoding="utf-8") as file:
-                visits: List[dict] = json.load(file)
-        except (OSError, json.JSONDecodeError) as exc:
+            visits = self._load_vessel_visit_json()
+        except ValueError as exc:
             logger.warning("TOSLoader: failed to load vessel visits for yard cleanup: %s", exc)
             return empty_result
 
@@ -540,9 +702,8 @@ class TOSLoader:
             return empty_result
 
         try:
-            with open(self.wq_path, "r", encoding="utf-8") as file:
-                raw = json.load(file)
-        except (OSError, json.JSONDecodeError) as exc:
+            raw = self._load_wq_json()
+        except ValueError as exc:
             logger.warning("TOSLoader: failed to load WQ data for yard cleanup: %s", exc)
             return {
                 "candidate_vessels": list(candidates.values()),
@@ -604,9 +765,8 @@ class TOSLoader:
             return empty_result
 
         try:
-            with open(self.vessel_visit_path, "r", encoding="utf-8") as file:
-                visits: List[dict] = json.load(file)
-        except (OSError, json.JSONDecodeError) as exc:
+            visits = self._load_vessel_visit_json()
+        except ValueError as exc:
             logger.warning("TOSLoader: failed to load vessel visits for yard busy profile: %s", exc)
             return empty_result
 
@@ -617,13 +777,9 @@ class TOSLoader:
                 continue
             eta = self._parse_dt(item.get("eta"))
             etd = self._parse_dt(item.get("etd"))
-            if eta is None and etd is None:
+            if etd is None:
                 continue
-            visit_start = eta or window_start
-            visit_end = etd or (visit_start + timedelta(hours=48))
-            if visit_end <= visit_start:
-                visit_end = visit_start + timedelta(hours=48)
-            if visit_start >= window_end or visit_end <= window_start:
+            if etd < window_start or etd >= window_end:
                 continue
             candidates[visit_key] = {
                 "vesselVisitKey": visit_key,
@@ -636,9 +792,8 @@ class TOSLoader:
             return empty_result
 
         try:
-            with open(self.wq_path, "r", encoding="utf-8") as file:
-                raw = json.load(file)
-        except (OSError, json.JSONDecodeError) as exc:
+            raw = self._load_wq_json()
+        except ValueError as exc:
             logger.warning("TOSLoader: failed to load WQ data for yard busy profile: %s", exc)
             return {
                 "candidate_vessels": list(candidates.values()),
@@ -680,8 +835,7 @@ class TOSLoader:
         plan_start_time: Optional[datetime] = None,
         plan_end_time: Optional[datetime] = None,
     ) -> Dict[str, Vessel]:
-        with open(self.vessel_visit_path, "r", encoding="utf-8") as file:
-            raw: List[dict] = json.load(file)
+        raw = self._load_vessel_visit_json()
 
         berth_plans = self._load_berth_plans_by_visit_key()
         berth_centers = self._load_berth_centers()
@@ -721,6 +875,9 @@ class TOSLoader:
             berth_plan = berth_plans.get(item_visit_dbkey or -1, {})
             berth_key = self._coerce_line_key(berth_plan.get("berthKey"))
             berth_coordinate = berth_centers.get(berth_key) if berth_key is not None else None
+            eqp_num = self._coerce_line_key(
+                item.get("eqpNum") if item.get("eqpNum") is not None else item.get("EQP_NUM")
+            )
 
             vessels[vessel_visit_id] = Vessel(
                 vessel_id=vessel_id_str,
@@ -731,6 +888,7 @@ class TOSLoader:
                 berth_id=str(berth_key or ""),
                 berth_key=berth_key,
                 berth_coordinate=berth_coordinate,
+                eqp_num=eqp_num,
             )
 
         missing = target_set - matched_line_keys
@@ -782,14 +940,14 @@ class TOSLoader:
         vessels: Dict[str, Vessel],
         vessel_key: Optional[int] = None,
     ) -> List[Container]:
-        # 出口箱：217getBoundList 的 Outbound；当前数据里 boundType/visitType 与 Inbound 一致，均为 (1,1)。
+        # 出口箱：217getBoundList 的 Outbound； boundType =2 时为出口箱
         return self._load_bound_containers(
             line_keys=line_keys,
             vessel_key=vessel_key,
             vessels=vessels,
             section_name="Outbound",
             business_type=BusinessType.EXPORT,
-            expected_bound_type=1,
+            expected_bound_type=2,
             expected_visit_type=1,
             description="装船箱",
         )
@@ -806,8 +964,7 @@ class TOSLoader:
         expected_visit_type: int,
         description: str,
     ) -> List[Container]:
-        with open(self.bound_list_path, "r", encoding="utf-8") as file:
-            raw: dict = json.load(file)
+        raw = self._load_bound_list_json()
 
         entries: List[dict] = raw.get(section_name, [])
         target_set = self._coerce_line_key_set(line_keys)
@@ -874,6 +1031,7 @@ class TOSLoader:
                     pod=container_raw.get("pod"),
                     cattier_kind=container_raw.get("cattierKind"),
                     trade_code=container_raw.get("tradeCode"),
+                    service_line_code=container_raw.get("serviceLineCode"),
                     freight_kind=container_raw.get("freightKind"),
                     owner_company=container_raw.get("ownerCompany"),
                     line_company=container_raw.get("lineCompany"),
@@ -910,15 +1068,870 @@ class TOSLoader:
             )
         return containers
 
+    def build_type2_space_allocation_plan(
+        self,
+        *,
+        containers: List[Container],
+        yard: Any,
+    ) -> Dict[str, Any]:
+        raw_plan = self._load_space_allocation_plan()
+        group_map = raw_plan.get("groupMap", {})
+        if not isinstance(group_map, dict):
+            raise ValueError("getSpcaeAllocation groupMap must be an object")
+
+        ordered_groups = self._ordered_space_allocation_groups(group_map)
+        containers_by_group: Dict[str, List[Container]] = defaultdict(list)
+        unmatched_container_ids: List[str] = []
+
+        for container in containers:
+            group_key = self._match_space_allocation_group(container, ordered_groups)
+            if group_key is None:
+                unmatched_container_ids.append(container.container_id)
+                continue
+            containers_by_group[group_key].append(container)
+
+        planned_ranges = self._all_active_space_ranges(group_map)
+        updated_group_map: Dict[str, Dict[str, Any]] = {}
+        summaries: Dict[str, Dict[str, Any]] = {}
+        warnings: List[str] = []
+
+        for group_key, members in containers_by_group.items():
+            original_group = group_map.get(group_key)
+            if not isinstance(original_group, dict):
+                continue
+
+            original_ranges = self._normalize_range_list(original_group.get("rangeList"))
+            demand_by_size = self._container_demand_by_size(members)
+            existing_capacity_by_size = {
+                size_int: self._range_capacity_for_size(yard, original_ranges, size_int)
+                for size_int in (1, 2, 3)
+            }
+
+            deficit_by_size = {
+                size_int: max(
+                    0,
+                    demand_by_size.get(size_int, 0)
+                    - existing_capacity_by_size.get(size_int, 0),
+                )
+                for size_int in (1, 2, 3)
+            }
+            new_ranges: List[Dict[str, Any]] = []
+            added_capacity_by_size: Dict[int, int] = {}
+            next_range_seq = self._next_range_seq(original_ranges)
+
+            for size_int in (1, 2, 3):
+                deficit = deficit_by_size.get(size_int, 0)
+                if deficit <= 0:
+                    added_capacity_by_size[size_int] = 0
+                    continue
+
+                selected_ranges, added_capacity, next_range_seq = self._new_ranges_for_deficit(
+                    yard=yard,
+                    size_int=size_int,
+                    deficit=deficit,
+                    excluded_ranges=planned_ranges + new_ranges,
+                    template_ranges=original_ranges,
+                    next_range_seq=next_range_seq,
+                )
+                new_ranges.extend(selected_ranges)
+                added_capacity_by_size[size_int] = added_capacity
+                if added_capacity < deficit:
+                    warnings.append(
+                        f"groupKey={group_key} size={size_int} deficit={deficit} "
+                        f"addedCapacity={added_capacity}"
+                    )
+
+            if new_ranges:
+                updated_group = deepcopy(original_group)
+                updated_group["rangeList"] = deepcopy(original_ranges) + new_ranges
+                updated_group_map[group_key] = updated_group
+                planned_ranges.extend(new_ranges)
+
+            summaries[group_key] = {
+                "groupName": original_group.get("groupName"),
+                "containerCount": len(members),
+                "demandBySize": demand_by_size,
+                "existingCapacityBySize": existing_capacity_by_size,
+                "deficitBySize": deficit_by_size,
+                "addedCapacityBySize": added_capacity_by_size,
+                "newRangeCount": len(new_ranges),
+            }
+
+        logger.info(
+            "TOSLoader: type=2 matched %s/%s containers into %s groups; "
+            "%s groups need new ranges",
+            sum(len(items) for items in containers_by_group.values()),
+            len(containers),
+            len(containers_by_group),
+            len(updated_group_map),
+        )
+        if unmatched_container_ids:
+            logger.warning(
+                "TOSLoader: type=2 unmatched containers: %s",
+                unmatched_container_ids[:20],
+            )
+        if warnings:
+            logger.warning("TOSLoader: type=2 range capacity warnings: %s", warnings[:20])
+
+        api_data = self._space_group_map_to_range_plan_data(updated_group_map)
+        return {
+            "data": api_data,
+            "groupMap": updated_group_map,
+            "summary": summaries,
+            "matchedContainerCount": sum(
+                len(items) for items in containers_by_group.values()
+            ),
+            "unmatchedContainerIds": unmatched_container_ids,
+            "warnings": warnings,
+        }
+
+    def _space_group_map_to_range_plan_data(
+        self,
+        group_map: Dict[str, Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        data: List[Dict[str, Any]] = []
+        for group_key, group in sorted(
+            group_map.items(),
+            key=lambda item: self._coerce_priority(item[0], default=999999999),
+        ):
+            group_key_int = self._coerce_line_key(group.get("groupKey"))
+            if group_key_int is None:
+                group_key_int = self._coerce_line_key(group_key)
+            range_list = [
+                self._space_range_item_for_api(range_item)
+                for range_item in self._normalize_range_list(group.get("rangeList"))
+            ]
+            if not range_list:
+                continue
+            data.append(
+                {
+                    "groupKey": group_key_int,
+                    "groupId": group_key_int,
+                    "rangeList": range_list,
+                    "filter": self._space_filter_for_api(group.get("filterAll") or {}),
+                }
+            )
+        return data
+
+    @staticmethod
+    def _space_range_item_for_api(range_item: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "blockId": str(range_item.get("blockId") or ""),
+            "startBayIndex": int(range_item.get("startBayIndex") or 0),
+            "endBayIndex": int(range_item.get("endBayIndex") or 0),
+            "startStackIndex": int(range_item.get("startStackIndex") or 0),
+            "endStackIndex": int(range_item.get("endStackIndex") or 0),
+            "startTierIndex": int(range_item.get("startTierIndex") or 1),
+            "endTierIndex": int(range_item.get("endTierIndex") or MAX_TIERS_PER_COLUMN),
+        }
+
+    def _space_filter_for_api(self, filter_all: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "filterName": str(filter_all.get("filterName") or ""),
+            "isoType": self._space_filter_list(filter_all.get("isoType"), str),
+            "category": self._space_filter_list(filter_all.get("category"), int),
+            "pod": self._space_filter_list(filter_all.get("pod"), str),
+            "cattierKind": self._space_filter_list(filter_all.get("cattierKind"), str),
+            "tradeCode": self._space_filter_list(filter_all.get("tradeCode"), str),
+            "freightKind": self._space_filter_list(filter_all.get("freightKind"), int),
+            "bReefer": self._space_filter_bool(filter_all.get("bReefer")),
+            "bHazardous": self._space_filter_bool(filter_all.get("bHazardous")),
+            "bDamage": self._space_filter_bool(filter_all.get("bDamage")),
+            "bHigh": self._space_filter_bool(filter_all.get("bHigh")),
+            "bGauge": self._space_filter_bool(filter_all.get("bGauge")),
+            "ownerCompany": self._space_filter_list(filter_all.get("ownerCompany"), str),
+            "lineCompany": self._space_filter_list(filter_all.get("lineCompany"), str),
+            "truckCompany": self._space_filter_list(filter_all.get("truckCompany"), str),
+            "belongerCompany": self._space_filter_list(
+                filter_all.get("belongerCompany"),
+                str,
+            ),
+            "bDirty": self._space_filter_bool(filter_all.get("bDirty")),
+            "weightClass": self._space_optional_int(filter_all.get("weightClass")),
+            "weightMin": filter_all.get("weightMin"),
+            "weightMax": filter_all.get("weightMax"),
+            "workType": self._space_optional_int(filter_all.get("workType")),
+            "bol": self._space_filter_list(filter_all.get("bol"), str),
+            "damageCode": self._space_filter_list(filter_all.get("damageCode"), str),
+        }
+
+    @classmethod
+    def _space_filter_list(cls, value: Any, converter: Any) -> List[Any]:
+        if cls._wildcard(value):
+            return []
+        values = value if isinstance(value, (list, tuple, set)) else [value]
+        result: List[Any] = []
+        for item in values:
+            if cls._wildcard(item):
+                continue
+            try:
+                result.append(converter(item))
+            except (TypeError, ValueError):
+                continue
+        return result
+
+    @staticmethod
+    def _space_filter_bool(value: Any) -> bool:
+        if value is None or value == "%":
+            return False
+        return TOSLoader._coerce_bool(value)
+
+    @staticmethod
+    def _space_optional_int(value: Any) -> Optional[int]:
+        if value is None or value == "%":
+            return None
+        return TOSLoader._coerce_line_key(value)
+
+    def _load_space_allocation_plan(self) -> Dict[str, Any]:
+        try:
+            raw = self._load_space_allocation_json()
+        except ValueError as exc:
+            raise ValueError(
+                f"failed to load getSpcaeAllocation file: {self.space_allocation_path}"
+            ) from exc
+        if not isinstance(raw, dict):
+            raise ValueError("getSpcaeAllocation root must be an object")
+        return raw
+
+    def _ordered_space_allocation_groups(
+        self,
+        group_map: Dict[str, Any],
+    ) -> List[Tuple[str, Dict[str, Any]]]:
+        groups = [
+            (str(group_key), group)
+            for group_key, group in group_map.items()
+            if isinstance(group, dict)
+        ]
+        groups.sort(
+            key=lambda item: (
+                self._coerce_priority(item[1].get("groupPriority"), default=999999),
+                -self._space_group_specificity(item[1]),
+                self._coerce_priority(item[1].get("groupKey"), default=999999999),
+                item[0],
+            )
+        )
+        return groups
+
+    def _match_space_allocation_group(
+        self,
+        container: Container,
+        ordered_groups: List[Tuple[str, Dict[str, Any]]],
+    ) -> Optional[str]:
+        for group_key, group in ordered_groups:
+            if self._space_allocation_group_matches(container, group):
+                return group_key
+        return None
+
+    def _space_allocation_group_matches(
+        self,
+        container: Container,
+        group: Dict[str, Any],
+    ) -> bool:
+        if not self._constraint_matches(group.get("category"), container.category, {-1}):
+            return False
+        if not self._constraint_matches(group.get("pod"), container.pod):
+            return False
+        if not self._vessel_constraint_matches(group.get("vesselId"), container):
+            return False
+        if not self._carrier_kind_matches(
+            group.get("carrierKind"),
+            group.get("carrierKindType"),
+            container,
+        ):
+            return False
+
+        filter_all = group.get("filterAll") or {}
+        if not isinstance(filter_all, dict):
+            return True
+
+        field_map = {
+            "isoType": "iso_type",
+            "category": "category",
+            "pod": "pod",
+            "cattierKind": "cattier_kind",
+            "tradeCode": "trade_code",
+            "freightKind": "freight_kind",
+            "bReefer": "is_reefer",
+            "bHazardous": "is_hazardous",
+            "bDamage": "is_damage",
+            "bHigh": "is_high",
+            "bGauge": "is_gauge",
+            "ownerCompany": "owner_company",
+            "lineCompany": "line_company",
+            "truckCompany": "truck_company",
+            "belongerCompany": "belonger_company",
+            "bDirty": "is_dirty",
+            "workType": "work_type",
+            "bol": "bol",
+            "damageCode": "damage_code",
+        }
+        for filter_key, container_attr in field_map.items():
+            if not self._constraint_matches(
+                filter_all.get(filter_key),
+                getattr(container, container_attr, None),
+            ):
+                return False
+
+        weight_min = filter_all.get("weightMin")
+        weight_max = filter_all.get("weightMax")
+        if weight_min is not None or weight_max is not None:
+            weight = self._coerce_float(container.raw_weight)
+            if weight is None:
+                return False
+            min_value = self._coerce_float(weight_min)
+            max_value = self._coerce_float(weight_max)
+            if min_value is not None and weight < min_value:
+                return False
+            if max_value is not None and weight > max_value:
+                return False
+
+        weight_class = filter_all.get("weightClass")
+        if not self._wildcard(weight_class):
+            actual = container.weight_class.value if container.weight_class else None
+            if not self._constraint_matches(weight_class, actual):
+                return False
+
+        return True
+
+    def _carrier_kind_matches(
+        self,
+        carrier_kind: Any,
+        carrier_kind_type: Any,
+        container: Container,
+    ) -> bool:
+        if self._wildcard(carrier_kind):
+            return True
+
+        kind_type = self._coerce_line_key(carrier_kind_type)
+        if kind_type == 1:
+            candidates = [container.service_line_code, container.line_key]
+        elif kind_type == 2:
+            candidates = [container.line_company]
+        elif kind_type == 3:
+            candidates = [container.voyage_id, container.vessel_id]
+        else:
+            candidates = [
+                container.service_line_code,
+                container.line_key,
+                container.line_company,
+                container.voyage_id,
+                container.vessel_id,
+            ]
+        return any(self._constraint_matches(carrier_kind, candidate) for candidate in candidates)
+
+    def _vessel_constraint_matches(
+        self,
+        vessel_constraint: Any,
+        container: Container,
+    ) -> bool:
+        if self._wildcard(vessel_constraint):
+            return True
+        return any(
+            self._constraint_matches(vessel_constraint, candidate)
+            for candidate in (container.vessel_id, container.voyage_id)
+        )
+
+    @classmethod
+    def _constraint_matches(
+        cls,
+        expected: Any,
+        actual: Any,
+        extra_wildcards: Optional[Set[Any]] = None,
+    ) -> bool:
+        if cls._wildcard(expected):
+            return True
+        if extra_wildcards and expected in extra_wildcards:
+            return True
+        if isinstance(expected, (list, tuple, set)):
+            if not expected:
+                return True
+            return any(cls._constraint_matches(item, actual, extra_wildcards) for item in expected)
+        if actual is None:
+            return False
+        return cls._values_equal(expected, actual)
+
+    @staticmethod
+    def _wildcard(value: Any) -> bool:
+        if value is None:
+            return True
+        if isinstance(value, str):
+            return value.strip() in ("", "%")
+        if isinstance(value, (list, tuple, set)):
+            return not value or any(TOSLoader._wildcard(item) for item in value)
+        return False
+
+    @staticmethod
+    def _values_equal(expected: Any, actual: Any) -> bool:
+        if isinstance(expected, bool) or isinstance(actual, bool):
+            return bool(expected) == bool(actual)
+
+        expected_number = TOSLoader._coerce_float(expected)
+        actual_number = TOSLoader._coerce_float(actual)
+        if expected_number is not None and actual_number is not None:
+            return expected_number == actual_number
+
+        return str(expected).strip().upper() == str(actual).strip().upper()
+
+    @staticmethod
+    def _coerce_float(raw_value: Any) -> Optional[float]:
+        if raw_value is None or isinstance(raw_value, bool):
+            return None
+        try:
+            return float(raw_value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _coerce_priority(raw_value: Any, default: int) -> int:
+        try:
+            return int(raw_value)
+        except (TypeError, ValueError):
+            return default
+
+    def _space_group_specificity(self, group: Dict[str, Any]) -> int:
+        score = 0
+        for key in ("category", "carrierKind", "pod", "vesselId"):
+            value = group.get(key)
+            if key == "category" and value == -1:
+                continue
+            if not self._wildcard(value):
+                score += 1
+
+        filter_all = group.get("filterAll") or {}
+        if isinstance(filter_all, dict):
+            for key, value in filter_all.items():
+                if key in ("weightMin", "weightMax"):
+                    if value is not None:
+                        score += 1
+                elif not self._wildcard(value):
+                    score += 1
+        return score
+
+    @staticmethod
+    def _normalize_range_list(raw_range_list: Any) -> List[Dict[str, Any]]:
+        if not raw_range_list:
+            return []
+        if not isinstance(raw_range_list, list):
+            return []
+        return [
+            deepcopy(item)
+            for item in raw_range_list
+            if isinstance(item, dict) and item.get("active", True)
+        ]
+
+    def _all_active_space_ranges(
+        self,
+        group_map: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        ranges: List[Dict[str, Any]] = []
+        for group in group_map.values():
+            if not isinstance(group, dict):
+                continue
+            ranges.extend(self._normalize_range_list(group.get("rangeList")))
+        return ranges
+
+    @staticmethod
+    def _container_demand_by_size(containers: List[Container]) -> Dict[int, int]:
+        demand: Dict[int, int] = defaultdict(int)
+        for container in containers:
+            if container.size == ContainerSize.SIZE_40:
+                demand[2] += 1
+            elif container.size == ContainerSize.SIZE_45:
+                demand[3] += 1
+            else:
+                demand[1] += 1
+        return dict(demand)
+
+    def _range_capacity_for_size(
+        self,
+        yard: Any,
+        ranges: List[Dict[str, Any]],
+        size_int: int,
+    ) -> int:
+        if not ranges:
+            return 0
+
+        used: Set[Tuple[Any, ...]] = set()
+        total = 0
+        for record in self._available_column_records(
+            yard=yard,
+            size_int=size_int,
+            include_ranges=ranges,
+            exclude_ranges=None,
+        ):
+            for tier in record["tiers"]:
+                atom = (*record["key"], tier)
+                if atom in used:
+                    continue
+                used.add(atom)
+                total += 1
+        return total
+
+    def _new_ranges_for_deficit(
+        self,
+        *,
+        yard: Any,
+        size_int: int,
+        deficit: int,
+        excluded_ranges: List[Dict[str, Any]],
+        template_ranges: List[Dict[str, Any]],
+        next_range_seq: int,
+    ) -> Tuple[List[Dict[str, Any]], int, int]:
+        selected: List[Dict[str, Any]] = []
+        added_capacity = 0
+
+        for record in self._available_column_records(
+            yard=yard,
+            size_int=size_int,
+            include_ranges=None,
+            exclude_ranges=excluded_ranges,
+        ):
+            selected.append(record)
+            added_capacity += len(record["tiers"])
+            if added_capacity >= deficit:
+                break
+
+        if not selected:
+            return [], 0, next_range_seq
+
+        ranges = self._records_to_ranges(
+            selected,
+            template_ranges=template_ranges,
+            next_range_seq=next_range_seq,
+        )
+        return ranges, added_capacity, next_range_seq + len(ranges)
+
+    def _available_column_records(
+        self,
+        *,
+        yard: Any,
+        size_int: int,
+        include_ranges: Optional[List[Dict[str, Any]]],
+        exclude_ranges: Optional[List[Dict[str, Any]]],
+    ) -> List[Dict[str, Any]]:
+        records: List[Dict[str, Any]] = []
+        large = size_int in (2, 3)
+
+        for (block_id, bay_idx, stack_idx), stack_info in yard.stacks.items():
+            if large:
+                record = self._large_column_record(
+                    yard,
+                    block_id,
+                    bay_idx,
+                    stack_idx,
+                    stack_info,
+                    size_int,
+                )
+            else:
+                record = self._single_column_record(
+                    block_id,
+                    bay_idx,
+                    stack_idx,
+                    stack_info,
+                    size_int,
+                )
+
+            if record is None:
+                continue
+            if include_ranges is not None:
+                record["tiers"] = [
+                    tier
+                    for tier in record["tiers"]
+                    if self._record_tier_in_ranges(record, tier, include_ranges)
+                ]
+                if not record["tiers"]:
+                    continue
+            if exclude_ranges and self._record_overlaps_ranges(record, exclude_ranges):
+                continue
+            records.append(record)
+
+        records.sort(
+            key=lambda item: (
+                item["blockId"],
+                item["startBayIndex"],
+                item["endBayIndex"],
+                item["stackIndex"],
+            )
+        )
+        return records
+
+    def _single_column_record(
+        self,
+        block_id: str,
+        bay_idx: int,
+        stack_idx: int,
+        stack_info: Dict[str, Any],
+        size_int: int,
+    ) -> Optional[Dict[str, Any]]:
+        tiers = self._remaining_20ft_tiers(stack_info)
+        if not tiers:
+            return None
+        return {
+            "key": (size_int, block_id, int(bay_idx), int(stack_idx)),
+            "blockId": block_id,
+            "startBayIndex": int(bay_idx),
+            "endBayIndex": int(bay_idx),
+            "stackIndex": int(stack_idx),
+            "tiers": tiers,
+        }
+
+    def _large_column_record(
+        self,
+        yard: Any,
+        block_id: str,
+        bay_idx: int,
+        stack_idx: int,
+        stack_info: Dict[str, Any],
+        size_int: int,
+    ) -> Optional[Dict[str, Any]]:
+        tiers = self._remaining_large_tiers(yard, stack_info)
+        if not tiers:
+            return None
+
+        first_tier = min(tiers)
+        slot_40ft = (stack_info.get("tiers") or {}).get(first_tier, {}).get("slot_40ft")
+        display_bays = self._display_bays_for_40ft_slot(
+            yard,
+            slot_40ft,
+            fallback_bay=int(bay_idx),
+        )
+        return {
+            "key": (size_int, block_id, int(bay_idx), int(stack_idx)),
+            "blockId": block_id,
+            "startBayIndex": min(display_bays),
+            "endBayIndex": max(display_bays),
+            "stackIndex": int(stack_idx),
+            "tiers": tiers,
+        }
+
+    @staticmethod
+    def _remaining_20ft_tiers(stack_info: Dict[str, Any]) -> List[int]:
+        top = int(stack_info.get("top_occupied_tier") or 0)
+        max_tier = int(stack_info.get("max_tier") or MAX_TIERS_PER_COLUMN)
+        tiers_data = stack_info.get("tiers") or {}
+        tiers: List[int] = []
+        for tier in range(top + 1, max_tier + 1):
+            tier_data = tiers_data.get(tier, {})
+            if not tier_data.get("free_20ft", False):
+                break
+            tiers.append(tier)
+        return tiers
+
+    def _remaining_large_tiers(
+        self,
+        yard: Any,
+        stack_info: Dict[str, Any],
+    ) -> List[int]:
+        top = int(stack_info.get("top_occupied_tier") or 0)
+        max_tier = int(stack_info.get("max_tier") or MAX_TIERS_PER_COLUMN)
+        tiers_data = stack_info.get("tiers") or {}
+        tiers: List[int] = []
+
+        for tier in range(top + 1, max_tier + 1):
+            tier_data = tiers_data.get(tier, {})
+            slot_40ft = tier_data.get("slot_40ft")
+            if not slot_40ft or not tier_data.get("free_40ft", False):
+                break
+            if not tiers and not self._large_tier_supported(yard, slot_40ft, tier):
+                break
+            tiers.append(tier)
+        return tiers
+
+    @staticmethod
+    def _large_tier_supported(yard: Any, slot_40ft: str, tier: int) -> bool:
+        if tier <= 1:
+            return True
+        slot_info = getattr(yard, "slots_40ft", {}).get(slot_40ft, {})
+        for related_name in slot_info.get("related_20ft", []):
+            related = getattr(yard, "slots_20ft", {}).get(related_name)
+            if not related:
+                continue
+            related_stack = yard.stacks.get(
+                (
+                    related["blockId"],
+                    related["bayIdx"],
+                    related["stackIdx"],
+                )
+            )
+            if related_stack and int(related_stack.get("top_occupied_tier") or 0) < tier - 1:
+                return False
+        return True
+
+    @staticmethod
+    def _display_bays_for_40ft_slot(
+        yard: Any,
+        slot_40ft: Optional[str],
+        fallback_bay: int,
+    ) -> Tuple[int, int]:
+        if not slot_40ft:
+            return fallback_bay, fallback_bay
+        slot_info = getattr(yard, "slots_40ft", {}).get(slot_40ft, {})
+        bay_numbers: List[int] = []
+        for related_name in slot_info.get("related_20ft", []):
+            related = getattr(yard, "slots_20ft", {}).get(related_name)
+            if related:
+                bay_numbers.append(int(related["bayIdx"]))
+        if not bay_numbers:
+            return fallback_bay, fallback_bay
+        return min(bay_numbers), max(bay_numbers)
+
+    def _record_tier_in_ranges(
+        self,
+        record: Dict[str, Any],
+        tier: int,
+        ranges: List[Dict[str, Any]],
+    ) -> bool:
+        return any(self._range_contains_record_tier(range_item, record, tier) for range_item in ranges)
+
+    def _record_overlaps_ranges(
+        self,
+        record: Dict[str, Any],
+        ranges: List[Dict[str, Any]],
+    ) -> bool:
+        for tier in record["tiers"]:
+            if self._record_tier_in_ranges(record, tier, ranges):
+                return True
+        return False
+
+    @staticmethod
+    def _range_contains_record_tier(
+        range_item: Dict[str, Any],
+        record: Dict[str, Any],
+        tier: int,
+    ) -> bool:
+        if range_item.get("blockId") != record["blockId"]:
+            return False
+
+        try:
+            start_bay = int(range_item.get("startBayIndex"))
+            end_bay = int(range_item.get("endBayIndex"))
+            start_stack = int(range_item.get("startStackIndex"))
+            end_stack = int(range_item.get("endStackIndex"))
+            start_tier = int(range_item.get("startTierIndex", 1))
+            end_tier = int(range_item.get("endTierIndex", MAX_TIERS_PER_COLUMN))
+        except (TypeError, ValueError):
+            return False
+
+        bay_start = min(start_bay, end_bay)
+        bay_end = max(start_bay, end_bay)
+        return (
+            bay_start <= record["startBayIndex"]
+            and record["endBayIndex"] <= bay_end
+            and min(start_stack, end_stack) <= record["stackIndex"] <= max(start_stack, end_stack)
+            and min(start_tier, end_tier) <= int(tier) <= max(start_tier, end_tier)
+        )
+
+    def _records_to_ranges(
+        self,
+        records: List[Dict[str, Any]],
+        *,
+        template_ranges: List[Dict[str, Any]],
+        next_range_seq: int,
+    ) -> List[Dict[str, Any]]:
+        if not records:
+            return []
+
+        ranges: List[Dict[str, Any]] = []
+        sorted_records = sorted(
+            records,
+            key=lambda item: (
+                item["blockId"],
+                item["startBayIndex"],
+                item["endBayIndex"],
+                item["stackIndex"],
+            ),
+        )
+
+        current = sorted_records[0].copy()
+        current_start_stack = current["stackIndex"]
+        current_end_stack = current["stackIndex"]
+
+        for record in sorted_records[1:]:
+            same_bay = (
+                record["blockId"] == current["blockId"]
+                and record["startBayIndex"] == current["startBayIndex"]
+                and record["endBayIndex"] == current["endBayIndex"]
+            )
+            if same_bay and record["stackIndex"] == current_end_stack + 1:
+                current_end_stack = record["stackIndex"]
+                continue
+
+            ranges.append(
+                self._build_new_range_item(
+                    current,
+                    current_start_stack,
+                    current_end_stack,
+                    template_ranges,
+                    next_range_seq + len(ranges),
+                )
+            )
+            current = record.copy()
+            current_start_stack = current["stackIndex"]
+            current_end_stack = current["stackIndex"]
+
+        ranges.append(
+            self._build_new_range_item(
+                current,
+                current_start_stack,
+                current_end_stack,
+                template_ranges,
+                next_range_seq + len(ranges),
+            )
+        )
+        return ranges
+
+    @staticmethod
+    def _build_new_range_item(
+        record: Dict[str, Any],
+        start_stack: int,
+        end_stack: int,
+        template_ranges: List[Dict[str, Any]],
+        range_seq: int,
+    ) -> Dict[str, Any]:
+        template = template_ranges[0] if template_ranges else {}
+        return {
+            "blockId": record["blockId"],
+            "startBayIndex": int(record["startBayIndex"]),
+            "endBayIndex": int(record["endBayIndex"]),
+            "startStackIndex": int(start_stack),
+            "endStackIndex": int(end_stack),
+            "startTierIndex": 1,
+            "endTierIndex": MAX_TIERS_PER_COLUMN,
+            "slotSize": template.get("slotSize", 1),
+            "fillSeq": template.get("fillSeq", 0),
+            "active": template.get("active", True),
+            "mixWeightType": template.get("mixWeightType", -1),
+            "prioritySeq": template.get("prioritySeq", 0),
+            "rangeSeq": range_seq,
+            "leaveKeySlot": template.get("leaveKeySlot", False),
+        }
+
+    @staticmethod
+    def _next_range_seq(ranges: List[Dict[str, Any]]) -> int:
+        max_seq = 0
+        for range_item in ranges:
+            try:
+                max_seq = max(max_seq, int(range_item.get("rangeSeq", 0)))
+            except (TypeError, ValueError):
+                continue
+        return max_seq + 1
+
     def load_external_allocation_groups(
         self,
-        line_keys: int,
+        line_keys: Optional[int],
+        vessel_key: Optional[int],
         vessels: Dict[str, Vessel],
     ) -> List[AllocationGroup]:
         normalized_line_key = self._coerce_line_key(line_keys)
+        normalized_vessel_key = self._coerce_line_key(vessel_key)
+        target_description = (
+            f"visitDbkey={normalized_vessel_key}"
+            if normalized_vessel_key is not None
+            else f"lineKey={normalized_line_key}"
+        )
         raise NotImplementedError(
             "type=2 需要从外部分配组接口读取数据；接口未提供，"
-            f"已预留 load_external_allocation_groups(line_keys={normalized_line_key})"
+            f"已预留 load_external_allocation_groups({target_description})"
         )
 
     def build_planning_horizon(

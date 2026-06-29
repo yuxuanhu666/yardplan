@@ -119,6 +119,7 @@ class Container:
     pod: Optional[str] = None
     cattier_kind: Optional[str] = None
     trade_code: Optional[str] = None
+    service_line_code: Optional[str] = None
     freight_kind: Optional[int] = None
     owner_company: Optional[str] = None
     line_company: Optional[str] = None
@@ -283,6 +284,7 @@ class Vessel:
     berth_id: str
     berth_key: Optional[int] = None
     berth_coordinate: Optional[Tuple[float, float]] = None
+    eqp_num: Optional[int] = None
     discharge_containers: List[Container] = field(default_factory=list)
     loading_containers: List[Container] = field(default_factory=list)
 
