@@ -96,11 +96,13 @@ class YardSpaceAdapter:
                     bay_number = int(stack_key[1])
                     if bay_number in existing_large_bays:
                         continue
-                    if YardSpaceAdapter._is_empty_20ft_column(stack_info):
+                    tiers = YardSpaceAdapter._remaining_20ft_tiers(stack_info)
+                    if tiers:
                         stage2_single_slots.append(
                             {
                                 "bay_number": bay_number,
                                 "stack_index": int(stack_key[2]),
+                                "tiers": tiers,
                             }
                         )
 
@@ -129,7 +131,8 @@ class YardSpaceAdapter:
 
                 for bay_idx in pair_bays:
                     for (stack_key, stack_info) in bay_groups.get(bay_idx, []):
-                        if not YardSpaceAdapter._is_empty_40ft_column(stack_info):
+                        tiers = YardSpaceAdapter._remaining_large_tiers(yard, stack_info)
+                        if not tiers:
                             continue
                         slot_40ft = YardSpaceAdapter._first_tier_value(
                             stack_info,
@@ -158,6 +161,7 @@ class YardSpaceAdapter:
                                 "bay_numbers": pair_bays,
                                 "display_bays": pair_bays,
                                 "stack_index": stack_index,
+                                "tiers": tiers,
                                 "is_edge_pair": is_edge,
                             }
                         )
@@ -275,6 +279,63 @@ class YardSpaceAdapter:
         if not YardSpaceAdapter._first_tier_value(stack_info, "slot_40ft"):
             return False
         return bool(YardSpaceAdapter._first_tier_value(stack_info, "free_40ft"))
+
+    @staticmethod
+    def _remaining_20ft_tiers(stack_info: Dict[str, Any]) -> List[int]:
+        top = int(stack_info.get("top_occupied_tier") or 0)
+        max_tier = int(stack_info.get("max_tier") or MAX_TIERS_PER_COLUMN)
+        tiers_data = stack_info.get("tiers") or {}
+        tiers: List[int] = []
+        for tier in range(top + 1, max_tier + 1):
+            tier_data = tiers_data.get(tier, {})
+            if not tier_data.get("free_20ft", False):
+                break
+            tiers.append(tier)
+        return tiers
+
+    @staticmethod
+    def _remaining_large_tiers(
+        yard: Any,
+        stack_info: Dict[str, Any],
+    ) -> List[int]:
+        top = int(stack_info.get("top_occupied_tier") or 0)
+        max_tier = int(stack_info.get("max_tier") or MAX_TIERS_PER_COLUMN)
+        tiers_data = stack_info.get("tiers") or {}
+        tiers: List[int] = []
+
+        for tier in range(top + 1, max_tier + 1):
+            tier_data = tiers_data.get(tier, {})
+            slot_40ft = tier_data.get("slot_40ft")
+            if not slot_40ft or not tier_data.get("free_40ft", False):
+                break
+            if not tiers and not YardSpaceAdapter._large_tier_supported(
+                yard,
+                slot_40ft,
+                tier,
+            ):
+                break
+            tiers.append(tier)
+        return tiers
+
+    @staticmethod
+    def _large_tier_supported(yard: Any, slot_40ft: str, tier: int) -> bool:
+        if tier <= 1:
+            return True
+        slot_info = getattr(yard, "slots_40ft", {}).get(slot_40ft, {})
+        for related_name in slot_info.get("related_20ft", []):
+            related = getattr(yard, "slots_20ft", {}).get(related_name)
+            if not related:
+                continue
+            related_stack = yard.stacks.get(
+                (
+                    related["blockId"],
+                    related["bayIdx"],
+                    related["stackIdx"],
+                )
+            )
+            if related_stack and int(related_stack.get("top_occupied_tier") or 0) < tier - 1:
+                return False
+        return True
 
     @staticmethod
     def _first_tier_value(stack_info: Dict[str, Any], key: str) -> Any:
@@ -1706,36 +1767,14 @@ class TOSLoader:
 
     @staticmethod
     def _remaining_20ft_tiers(stack_info: Dict[str, Any]) -> List[int]:
-        top = int(stack_info.get("top_occupied_tier") or 0)
-        max_tier = int(stack_info.get("max_tier") or MAX_TIERS_PER_COLUMN)
-        tiers_data = stack_info.get("tiers") or {}
-        tiers: List[int] = []
-        for tier in range(top + 1, max_tier + 1):
-            tier_data = tiers_data.get(tier, {})
-            if not tier_data.get("free_20ft", False):
-                break
-            tiers.append(tier)
-        return tiers
+        return YardSpaceAdapter._remaining_20ft_tiers(stack_info)
 
+    @staticmethod
     def _remaining_large_tiers(
-        self,
         yard: Any,
         stack_info: Dict[str, Any],
     ) -> List[int]:
-        top = int(stack_info.get("top_occupied_tier") or 0)
-        max_tier = int(stack_info.get("max_tier") or MAX_TIERS_PER_COLUMN)
-        tiers_data = stack_info.get("tiers") or {}
-        tiers: List[int] = []
-
-        for tier in range(top + 1, max_tier + 1):
-            tier_data = tiers_data.get(tier, {})
-            slot_40ft = tier_data.get("slot_40ft")
-            if not slot_40ft or not tier_data.get("free_40ft", False):
-                break
-            if not tiers and not self._large_tier_supported(yard, slot_40ft, tier):
-                break
-            tiers.append(tier)
-        return tiers
+        return YardSpaceAdapter._remaining_large_tiers(yard, stack_info)
 
     @staticmethod
     def _large_tier_supported(yard: Any, slot_40ft: str, tier: int) -> bool:

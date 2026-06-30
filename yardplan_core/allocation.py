@@ -2787,11 +2787,11 @@ class Stage2BayAllocator:
     """
     Stage 2: within each assigned yard area, decide concrete bay/column usage.
 
-    The implementation delegates to the SCIP model in `stage2_scip` while
+    The implementation delegates to the greedy allocator in `stage2_scip` while
     keeping the historical public interface unchanged.
 
     Sibling split groups that share the same parent and yard area are merged into
-    one Stage2 item before solving so bay-axis fragmentation penalties apply to a
+    one Stage2 item before placement so bay-axis fragmentation penalties apply to a
     single demand block (see `merge_same_parent_assignments_for_stage2`).
 
     Returns ``(bay_allocations, merged_area_assignments)`` — the latter replaces

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import colorsys
+import ast
 import json
 import math
 import os
@@ -98,6 +99,7 @@ class StackCell:
     width: float
     height: float
     occupied: bool
+    occupied_tiers: Tuple[int, ...] = ()
 
 
 @dataclass
@@ -147,6 +149,7 @@ class PlannedDrawItem:
     size: Optional[ContainerSize] = None
     is_spanning: bool = False
     is_edge_placement: bool = False
+    tier_ranges: Tuple[Tuple[int, int], ...] = ()
 
 
 class YardLayoutBuilder:
@@ -384,7 +387,8 @@ class YardLayoutBuilder:
         for bay_pos, bay_idx in enumerate(layout.bay_indices):
             for stack_pos, stack_idx in enumerate(layout.stack_indices):
                 stack_info = yard.stacks.get((layout.block_id, bay_idx, stack_idx), {})
-                occupied = _is_stack_occupied(stack_info)
+                occupied_tiers = _occupied_tiers(stack_info)
+                occupied = bool(occupied_tiers) or stack_info.get("top_occupied_tier", 0) > 0
                 x = layout.x + stack_pos * self.config.stack_width
                 y = layout.y + bay_pos * self.config.bay_height
                 layout.cells[(bay_idx, stack_idx)] = StackCell(
@@ -396,6 +400,7 @@ class YardLayoutBuilder:
                     width=self.config.stack_width,
                     height=self.config.bay_height,
                     occupied=occupied,
+                    occupied_tiers=occupied_tiers,
                 )
 
 
@@ -559,6 +564,10 @@ class YardVisualizer:
         groups_by_id: Dict[str, AllocationGroup] = {
             g.group_id: g for g in (result.allocation_groups or [])
         }
+        label_regions: Dict[
+            Tuple[str, int, int, str],
+            Tuple[float, float, float, float],
+        ] = {}
 
         for item in extract_planned_draw_items(result, layout):
             block = layout.blocks.get(item.block_id)
@@ -568,12 +577,19 @@ class YardVisualizer:
             cells = _cells_for_item(block, item)
             if not cells:
                 continue
-            conflict = any(cell.occupied for cell in cells)
+            conflict = any(_cell_conflicts_with_item(cell, item) for cell in cells)
 
             x0 = min(cell.x for cell in cells)
             y0 = min(cell.y for cell in cells)
             x1 = max(cell.x + cell.width for cell in cells)
             y1 = max(cell.y + cell.height for cell in cells)
+            label_group_id = _plan_parent_group_display_id(item.group_id, groups_by_id)
+            _merge_plan_label_region(
+                label_regions,
+                item,
+                (x0, y0, x1, y1),
+                label_group_id=label_group_id,
+            )
 
             if item.is_spanning or item.bay_start != item.bay_end:
                 ax.add_patch(
@@ -599,12 +615,10 @@ class YardVisualizer:
                             linewidth=2.0,
                         )
                     )
-                self._draw_plan_parent_center_label(
-                    ax, x0, y0, x1, y1, item.group_id, groups_by_id, mpatheffects
-                )
                 continue
 
             for cell in cells:
+                cell_conflict = _cell_conflicts_with_item(cell, item)
                 ax.add_patch(
                     rectangle_cls(
                         (cell.x, cell.y),
@@ -612,13 +626,20 @@ class YardVisualizer:
                         cell.height,
                         facecolor=color,
                         alpha=self.config.planned_alpha,
-                        edgecolor=self.config.conflict_edge_color if cell.occupied else "#222222",
-                        linewidth=1.5 if cell.occupied else 0.6,
-                        hatch="///" if cell.occupied else None,
+                        edgecolor=(
+                            self.config.conflict_edge_color
+                            if cell_conflict
+                            else "#222222"
+                        ),
+                        linewidth=1.5 if cell_conflict else 0.6,
+                        hatch="///" if cell_conflict else None,
                     )
                 )
+
+        for key, (x0, y0, x1, y1) in label_regions.items():
+            _block_id, _bay_start, _bay_end, group_id = key
             self._draw_plan_parent_center_label(
-                ax, x0, y0, x1, y1, item.group_id, groups_by_id, mpatheffects
+                ax, x0, y0, x1, y1, group_id, groups_by_id, mpatheffects
             )
 
     def _group_colors(self, result: Optional[PlanningResult]) -> Dict[str, str]:
@@ -712,6 +733,10 @@ def _items_from_bay_allocations(
     items: List[PlannedDrawItem] = []
     for allocation in allocations:
         block = layout.blocks.get(allocation.yard_area_id) if layout else None
+        exact_items = _items_from_allocation_exact_notes(allocation)
+        if exact_items:
+            items.extend(exact_items)
+            continue
         if allocation.bay_stack_details:
             for bay_spec, stack_start, stack_end in allocation.bay_stack_details:
                 bay_start, bay_end = _bay_range_from_spec(bay_spec)
@@ -726,6 +751,7 @@ def _items_from_bay_allocations(
                         size=allocation.size,
                         is_spanning=allocation.is_spanning,
                         is_edge_placement=allocation.is_edge_placement,
+                        tier_ranges=(),
                     )
                 )
             continue
@@ -744,9 +770,95 @@ def _items_from_bay_allocations(
                     size=allocation.size,
                     is_spanning=allocation.is_spanning,
                     is_edge_placement=allocation.is_edge_placement,
+                    tier_ranges=(),
                 )
             )
     return items
+
+
+def _items_from_allocation_exact_notes(
+    allocation: BayColumnAllocation,
+) -> List[PlannedDrawItem]:
+    exact = _extract_exact_note(allocation.notes)
+    if not exact:
+        return []
+
+    items: List[PlannedDrawItem] = []
+    for entry in exact.split("; "):
+        parsed = _parse_exact_entry(entry)
+        if parsed is None:
+            continue
+        bay_spec, stack_index, tier_ranges = parsed
+        bay_start, bay_end = _bay_range_from_spec(bay_spec)
+        items.append(
+            PlannedDrawItem(
+                group_id=allocation.group_id,
+                block_id=allocation.yard_area_id,
+                bay_start=bay_start,
+                bay_end=bay_end,
+                stack_start=stack_index,
+                stack_end=stack_index,
+                size=allocation.size,
+                is_spanning=allocation.is_spanning,
+                is_edge_placement=allocation.is_edge_placement,
+                tier_ranges=tuple(tier_ranges),
+            )
+        )
+    return items
+
+
+def _extract_exact_note(notes: str) -> str:
+    marker = "exact "
+    if not notes or marker not in notes:
+        return ""
+    return notes.split(marker, 1)[1].strip()
+
+
+def _parse_exact_entry(
+    entry: str,
+) -> Optional[Tuple[Any, int, List[Tuple[int, int]]]]:
+    prefix, sep, tiers_text = entry.partition(" tiers ")
+    if not sep:
+        return None
+    bay_text, sep, stack_text = prefix.partition(": stack ")
+    if not sep:
+        return None
+    try:
+        bay_spec = ast.literal_eval(bay_text.strip())
+    except (SyntaxError, ValueError):
+        try:
+            bay_spec = int(bay_text.strip())
+        except ValueError:
+            return None
+    try:
+        stack_index = int(stack_text.strip())
+    except ValueError:
+        return None
+    tier_ranges = _parse_tier_ranges(tiers_text.strip())
+    if not tier_ranges:
+        return None
+    return bay_spec, stack_index, tier_ranges
+
+
+def _parse_tier_ranges(text: str) -> List[Tuple[int, int]]:
+    ranges: List[Tuple[int, int]] = []
+    for part in text.split(","):
+        piece = part.strip()
+        if not piece:
+            continue
+        if "-" in piece:
+            left, right = piece.split("-", 1)
+            try:
+                start, end = int(left), int(right)
+            except ValueError:
+                continue
+        else:
+            try:
+                start = end = int(piece)
+            except ValueError:
+                continue
+        ranges.append((min(start, end), max(start, end)))
+    return ranges
 
 
 def _items_from_range_plan(result: PlanningResult) -> List[PlannedDrawItem]:
@@ -799,13 +911,63 @@ def _cells_for_item(block: BlockLayout, item: PlannedDrawItem) -> List[StackCell
     return cells
 
 
-def _is_stack_occupied(stack_info: Dict[str, Any]) -> bool:
-    if stack_info.get("top_occupied_tier", 0) > 0:
+def _merge_plan_label_region(
+    regions: Dict[Tuple[str, int, int, str], Tuple[float, float, float, float]],
+    item: PlannedDrawItem,
+    bbox: Tuple[float, float, float, float],
+    label_group_id: Optional[str] = None,
+) -> None:
+    bay_start = min(item.bay_start, item.bay_end)
+    bay_end = max(item.bay_start, item.bay_end)
+    key = (item.block_id, bay_start, bay_end, label_group_id or item.group_id)
+    current = regions.get(key)
+    if current is None:
+        regions[key] = bbox
+        return
+    regions[key] = (
+        min(current[0], bbox[0]),
+        min(current[1], bbox[1]),
+        max(current[2], bbox[2]),
+        max(current[3], bbox[3]),
+    )
+
+
+def _cell_conflicts_with_item(cell: StackCell, item: PlannedDrawItem) -> bool:
+    if not cell.occupied:
+        return False
+    if not item.tier_ranges:
         return True
-    for tier_data in stack_info.get("tiers", {}).values():
-        if tier_data.get("occupant") is not None:
-            return True
+    occupied = set(cell.occupied_tiers)
+    if not occupied:
+        return False
+    for start, end in item.tier_ranges:
+        for tier in range(int(start), int(end) + 1):
+            if tier in occupied:
+                return True
     return False
+
+
+def _occupied_tiers(stack_info: Dict[str, Any]) -> Tuple[int, ...]:
+    tiers = []
+    for tier_key, tier_data in (stack_info.get("tiers") or {}).items():
+        if tier_data.get("occupant") is None:
+            continue
+        try:
+            tiers.append(int(tier_key))
+            continue
+        except (TypeError, ValueError):
+            pass
+        tier_index = tier_data.get("tierIdx") or tier_data.get("tier_index")
+        if tier_index is None:
+            continue
+        try:
+            tiers.append(int(tier_index))
+        except (TypeError, ValueError):
+            continue
+    top = int(stack_info.get("top_occupied_tier") or 0)
+    if top > 0 and not tiers:
+        tiers.extend(range(1, top + 1))
+    return tuple(sorted(set(tiers)))
 
 
 __all__ = [

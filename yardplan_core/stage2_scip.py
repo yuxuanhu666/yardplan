@@ -15,7 +15,7 @@ from yardplan_core.models import (
     logger,
 )
 
-Atom = Tuple[int, int]
+Atom = Tuple[int, int, int]
 BaySpec = Any
 
 
@@ -178,12 +178,13 @@ def log_stage2_merged_parent_contiguity(
 
 @dataclass(frozen=True)
 class Stage2PlacementOption:
-    """One feasible column placement candidate inside a yard area."""
+    """One feasible tier placement candidate inside a yard area."""
 
     option_id: str
     bay_spec: BaySpec
     atoms: Tuple[Atom, ...]
     stack_index: int
+    tier_index: int
     zone: str
     rank: int
     segment_capacity: int = 1
@@ -215,18 +216,19 @@ class Stage2ScipConfig:
     segment_scarcity_weight: float = 250.0
     enforce_bay_run_contiguity: bool = False
     enforce_sequential_segment_fill: bool = True
+    sequential_fill_max_tier_demand: int = 80
     enforce_segment_min_fill: bool = False
     stack_run_weight: float = 600.0
-    isolated_cell_weight: float = 800.0
-    underfilled_segment_weight: float = 2_500.0
+    isolated_cell_weight: float = 0.0
+    underfilled_segment_weight: float = 0.0
     soft_geometric_region_axis: bool = True
 
 
 class ScipStage2BayAllocator:
     """
-    SCIP implementation of stage 2 bay/column allocation.
+    Greedy implementation of stage 2 bay/column allocation.
 
-    The model is built independently per yard area. Every decision consumes
+    Allocation is built independently per yard area. Every decision consumes
     bottom-level atoms `(bay_number, stack_index)`, so 20/40/45ft placements
     share the same physical resources and cannot overlap.
     """
@@ -258,14 +260,13 @@ class ScipStage2BayAllocator:
         area: YardArea,
         items: List[Tuple[AreaAssignment, AllocationGroup]],
     ) -> List[BayColumnAllocation]:
-        try:
-            from pyscipopt import Model, quicksum
-        except ImportError as exc:
-            raise RuntimeError(
-                "SCIP 第二阶段需要安装 PySCIPOpt，并且系统需可找到 SCIP C 库/头文件。"
-                "请先安装 SCIP，再安装 PySCIPOpt。"
-            ) from exc
+        return self._allocate_area_greedy(area, items)
 
+    def _allocate_area_greedy(
+        self,
+        area: YardArea,
+        items: List[Tuple[AreaAssignment, AllocationGroup]],
+    ) -> List[BayColumnAllocation]:
         if not items:
             return []
 
@@ -278,712 +279,398 @@ class ScipStage2BayAllocator:
                 item[0].assignment_id,
             ),
         )
-        item_keys = [self._item_key(assignment, index) for index, (assignment, _group) in enumerate(items)]
+        item_keys = [
+            self._item_key(assignment, index)
+            for index, (assignment, _group) in enumerate(items)
+        ]
         options_by_size = self._build_options(area)
+        column_base_tiers = self._column_base_tiers(options_by_size)
 
-        model = Model(f"stage2_{area.area_id}")
-        model.hideOutput(True)
-        if self.config.time_limit_seconds > 0:
-            model.setRealParam("limits/time", float(self.config.time_limit_seconds))
-
-        x: Dict[Tuple[str, str], Any] = {}
-        y: Dict[Tuple[str, BaySpec], Any] = {}
-        unmet: Dict[str, Any] = {}
-        placed_expr: Dict[str, Any] = {}
-        option_lookup: Dict[str, Stage2PlacementOption] = {}
-
-        for option_list in options_by_size.values():
-            for option in option_list:
-                option_lookup[option.option_id] = option
-
-        atom_to_vars: Dict[Atom, List[Any]] = defaultdict(list)
-        bay_to_vars: Dict[int, List[Any]] = defaultdict(list)
-        bay_available_atoms = self._available_atoms_by_bay(options_by_size)
-        used_20ft_bays: Dict[int, Any] = {}
-        used_large_pairs: Dict[BaySpec, Any] = {}
-        large_pairs_by_bay: Dict[int, List[Any]] = defaultdict(list)
-        segment_stack_vars: Dict[Tuple[str, BaySpec], Dict[int, Any]] = defaultdict(dict)
-        item_segments: Dict[str, Dict[BaySpec, Any]] = defaultdict(dict)
-
-        for item_key, (assignment, group) in zip(item_keys, items):
-            demand = max(0, int(assignment.column_demand))
-            size_options = options_by_size.get(group.size, [])
-            unmet[item_key] = model.addVar(
-                vtype="I",
-                lb=0,
-                ub=demand,
-                name=f"unmet_{item_key}",
-            )
-
-            item_vars: List[Any] = []
-            for option in size_options:
-                var = model.addVar(vtype="B", name=f"x_{item_key}_{option.option_id}")
-                x[(item_key, option.option_id)] = var
-                item_vars.append(var)
-
-                segment_key = option.bay_spec
-                if (item_key, segment_key) not in y:
-                    y[(item_key, segment_key)] = model.addVar(
-                        vtype="B",
-                        name=f"seg_{item_key}_{self._segment_name(segment_key)}",
-                    )
-                    item_segments[item_key][segment_key] = y[(item_key, segment_key)]
-                model.addCons(var <= y[(item_key, segment_key)])
-                segment_stack_vars[(item_key, segment_key)][option.stack_index] = var
-
-                for atom in option.atoms:
-                    atom_to_vars[atom].append(var)
-                    bay_to_vars[atom[0]].append(var)
-
-                if group.size == ContainerSize.SIZE_20:
-                    bay_number = option.atoms[0][0]
-                    if bay_number not in used_20ft_bays:
-                        used_20ft_bays[bay_number] = model.addVar(
-                            vtype="B",
-                            name=f"use20_bay_{bay_number}",
-                        )
-                    model.addCons(var <= used_20ft_bays[bay_number])
-                else:
-                    if option.bay_spec not in used_large_pairs:
-                        pair_var = model.addVar(
-                            vtype="B",
-                            name=f"use_large_{self._segment_name(option.bay_spec)}",
-                        )
-                        used_large_pairs[option.bay_spec] = pair_var
-                        for bay_number in {atom[0] for atom in option.atoms}:
-                            large_pairs_by_bay[bay_number].append(pair_var)
-                    model.addCons(var <= used_large_pairs[option.bay_spec])
-
-            placed = quicksum(item_vars) if item_vars else 0
-            placed_expr[item_key] = placed
-            model.addCons(placed + unmet[item_key] == demand, name=f"demand_{item_key}")
-
-        needs_geometric_axis = (
-            self.config.enforce_bay_run_contiguity
-            or self.config.enforce_sequential_segment_fill
-            or (
-                self.config.soft_geometric_region_axis
-                and self.config.region_component_weight > 0
-            )
+        selected_by_item: Dict[str, List[Stage2PlacementOption]] = {
+            item_key: []
+            for item_key in item_keys
+        }
+        occupied_atoms: Set[Atom] = set()
+        used_20ft_bays: Set[int] = set(
+            int(value)
+            for value in getattr(area, "_stage2_existing_20ft_bays", set())
         )
-        if needs_geometric_axis:
-            self._inject_geometric_segment_axis(
-                model,
-                area,
-                item_keys,
-                items,
-                y,
-                item_segments,
-            )
-
-        region_start_terms: List[Any] = []
-        stack_run_terms: List[Any] = []
-        isolated_cell_terms: List[Any] = []
-        underfilled_segment_terms: List[Any] = []
-        if self.config.enforce_stack_contiguity:
-            self._add_stack_contiguity_constraints(model, segment_stack_vars)
-        if self.config.enforce_segment_min_fill:
-            self._add_segment_fill_constraints(
-                model,
-                segment_stack_vars,
-                item_segments,
-                item_keys,
-                region_start_terms,
-            )
-        else:
-            self._add_region_start_constraints(
-                model,
-                item_segments,
-                item_keys,
-                region_start_terms,
-            )
-        if self.config.stack_run_weight > 0:
-            self._add_soft_stack_run_constraints(
-                model,
-                segment_stack_vars,
-                item_segments,
-                stack_run_terms,
-            )
-        if self.config.isolated_cell_weight > 0:
-            self._add_soft_isolated_cell_constraints(
-                model,
-                segment_stack_vars,
-                item_segments,
-                item_keys,
-                isolated_cell_terms,
-            )
-        if self.config.underfilled_segment_weight > 0:
-            self._add_soft_underfilled_segment_constraints(
-                model,
-                segment_stack_vars,
-                item_segments,
-                underfilled_segment_terms,
-            )
-        self._add_segment_activation_constraints(
-            model,
-            segment_stack_vars,
-            item_segments,
+        used_large_bays: Set[int] = set(
+            int(value)
+            for value in getattr(area, "_stage2_existing_large_bays", set())
         )
-        if self.config.enforce_bay_run_contiguity:
-            self._add_bay_run_contiguity_constraints(
-                model,
-                item_segments,
-                item_keys,
-            )
-        if self.config.enforce_sequential_segment_fill:
-            self._add_sequential_segment_fill_constraints(
-                model,
-                segment_stack_vars,
-                item_segments,
-                item_keys,
-            )
+        column_groups: Dict[Tuple[BaySpec, int], List[AllocationGroup]] = defaultdict(list)
+        column_sizes: Dict[Tuple[BaySpec, int], ContainerSize] = {}
+        column_selected_by_tier: Dict[
+            Tuple[BaySpec, int],
+            Dict[int, AllocationGroup],
+        ] = defaultdict(dict)
 
-        for atom, atom_vars in sorted(atom_to_vars.items()):
-            model.addCons(quicksum(atom_vars) <= 1, name=f"atom_{atom[0]}_{atom[1]}")
-
-        for bay_number, bay_vars in sorted(bay_to_vars.items()):
-            capacity = len(bay_available_atoms.get(bay_number, set()))
-            model.addCons(
-                quicksum(bay_vars) <= capacity,
-                name=f"bay_capacity_{bay_number}",
+        item_contexts = [
+            (
+                item_key,
+                assignment,
+                group,
+                self._tier_demand(assignment, group),
             )
+            for item_key, (assignment, group) in zip(item_keys, items)
+        ]
+        placement_order = sorted(
+            item_contexts,
+            key=lambda item: self._greedy_item_key(item[1], item[2], item[3]),
+        )
 
-        all_bays = set(used_20ft_bays) | set(large_pairs_by_bay)
-        for bay_number in sorted(all_bays):
-            terms: List[Any] = []
-            if bay_number in used_20ft_bays:
-                terms.append(used_20ft_bays[bay_number])
-            terms.extend(large_pairs_by_bay.get(bay_number, []))
-            if terms:
-                model.addCons(
-                    quicksum(terms) <= 1,
-                    name=f"bay_type_lock_{bay_number}",
+        for item_key, assignment, group, demand in placement_order:
+            if demand <= 0:
+                continue
+
+            selected = selected_by_item[item_key]
+            selected_set: Set[Stage2PlacementOption] = set(selected)
+            candidate_options = options_by_size.get(group.size, [])
+
+            while len(selected) < demand:
+                choice: Optional[Stage2PlacementOption] = None
+                for option in sorted(
+                    candidate_options,
+                    key=lambda candidate: self._greedy_option_key(
+                        candidate,
+                        selected,
+                    ),
+                ):
+                    if option in selected_set:
+                        continue
+                    if not self._greedy_option_feasible(
+                        option=option,
+                        group=group,
+                        occupied_atoms=occupied_atoms,
+                        used_20ft_bays=used_20ft_bays,
+                        used_large_bays=used_large_bays,
+                        column_groups=column_groups,
+                        column_sizes=column_sizes,
+                        column_selected_by_tier=column_selected_by_tier,
+                        column_base_tiers=column_base_tiers,
+                    ):
+                        continue
+                    choice = option
+                    break
+
+                if choice is None:
+                    break
+
+                selected.append(choice)
+                selected_set.add(choice)
+                self._record_greedy_option(
+                    option=choice,
+                    group=group,
+                    occupied_atoms=occupied_atoms,
+                    used_20ft_bays=used_20ft_bays,
+                    used_large_bays=used_large_bays,
+                    column_groups=column_groups,
+                    column_sizes=column_sizes,
+                    column_selected_by_tier=column_selected_by_tier,
                 )
 
-        load_a_terms: List[Any] = []
-        load_b_terms: List[Any] = []
-        stability_terms: List[Any] = []
-        stack_position_terms: List[Any] = []
-        segment_scarcity_terms: List[Any] = []
-        for (item_key, option_id), var in x.items():
-            option = option_lookup[option_id]
-            if option.zone == "A":
-                load_a_terms.append(var)
-            else:
-                load_b_terms.append(var)
-            stability_terms.append(float(option.rank) * var)
-            stack_position_terms.append(float(max(0, option.stack_index - 1)) * var)
-            segment_scarcity_terms.append(float(option.segment_scarcity_cost) * var)
-
-        load_a = quicksum(load_a_terms) if load_a_terms else 0
-        load_b = quicksum(load_b_terms) if load_b_terms else 0
-        balance = model.addVar(vtype="C", lb=0, name="crane_balance_abs")
-        model.addCons(balance >= load_a - load_b, name="balance_pos")
-        model.addCons(balance >= load_b - load_a, name="balance_neg")
-
-        objective = (
-            self.config.unmet_weight * quicksum(unmet.values())
-            + self.config.segment_weight * quicksum(y.values())
-            + self.config.region_component_weight * quicksum(region_start_terms)
-            + self.config.stack_run_weight * quicksum(stack_run_terms)
-            + self.config.isolated_cell_weight * quicksum(isolated_cell_terms)
-            + self.config.underfilled_segment_weight * quicksum(underfilled_segment_terms)
-            + self.config.crane_balance_weight * balance
-            + self.config.stability_weight * quicksum(stability_terms)
-            + self.config.stack_position_weight * quicksum(stack_position_terms)
-            + self.config.segment_scarcity_weight * quicksum(segment_scarcity_terms)
-        )
-        model.setObjective(objective, "minimize")
-        model.optimize()
-
-        status = str(model.getStatus())
-        if status not in {"optimal", "timelimit", "gaplimit", "bestsollimit"}:
-            logger.warning(f"Stage2 SCIP area {area.area_id} ended with status {status}")
+            if len(selected) < demand:
+                logger.warning(
+                    "Stage2 greedy area=%s group=%s placed=%s/%s unmet=%s",
+                    area.area_id,
+                    group.group_id,
+                    len(selected),
+                    demand,
+                    demand - len(selected),
+                )
 
         allocations: List[BayColumnAllocation] = []
-        for item_key, (assignment, group) in zip(item_keys, items):
-            selected: List[Stage2PlacementOption] = []
-            for option in options_by_size.get(group.size, []):
-                var = x.get((item_key, option.option_id))
-                if var is not None and model.getVal(var) > 0.5:
-                    selected.append(option)
-
-            allocation = self._build_allocation(
-                area=area,
-                assignment=assignment,
-                group=group,
-                selected=selected,
-                demand=max(0, int(assignment.column_demand)),
-                unmet_count=int(round(model.getVal(unmet[item_key]))),
-                status=status,
+        status = "greedy"
+        for item_key, assignment, group, demand in item_contexts:
+            selected = selected_by_item[item_key]
+            candidate_options = options_by_size.get(group.size, [])
+            unmet_count = max(0, demand - len(selected))
+            if unmet_count > 0:
+                self._log_unmet_diagnostics(
+                    area=area,
+                    assignment=assignment,
+                    group=group,
+                    demand=demand,
+                    unmet_count=unmet_count,
+                    candidate_options=candidate_options,
+                    selected=selected,
+                    status=status,
+                )
+            allocations.append(
+                self._build_allocation(
+                    area=area,
+                    assignment=assignment,
+                    group=group,
+                    selected=selected,
+                    demand=demand,
+                    unmet_count=unmet_count,
+                    status=status,
+                )
             )
-            allocations.append(allocation)
-
         return allocations
 
-    def _add_stack_contiguity_constraints(
+    def _record_greedy_option(
         self,
-        model: Any,
-        segment_stack_vars: Dict[Tuple[str, BaySpec], Dict[int, Any]],
+        *,
+        option: Stage2PlacementOption,
+        group: AllocationGroup,
+        occupied_atoms: Set[Atom],
+        used_20ft_bays: Set[int],
+        used_large_bays: Set[int],
+        column_groups: Dict[Tuple[BaySpec, int], List[AllocationGroup]],
+        column_sizes: Dict[Tuple[BaySpec, int], ContainerSize],
+        column_selected_by_tier: Dict[Tuple[BaySpec, int], Dict[int, AllocationGroup]],
     ) -> None:
-        """
-        For one item in one bay/large-bay segment, selected stacks must form
-        a physical contiguous interval. This prevents shapes like stack 1 and
-        stack 9 with holes in between.
-        """
-        for (item_key, segment), stack_vars in segment_stack_vars.items():
-            stacks = sorted(int(stack) for stack in stack_vars)
-            if len(stacks) <= 2:
-                continue
-            segment_name = self._segment_name(segment)
-            for left_index, left_stack in enumerate(stacks[:-2]):
-                left_var = stack_vars[left_stack]
-                for right_stack in stacks[left_index + 2 :]:
-                    right_var = stack_vars[right_stack]
-                    for middle_stack in range(left_stack + 1, right_stack):
-                        middle_var = stack_vars.get(middle_stack)
-                        if middle_var is None:
-                            model.addCons(
-                                left_var + right_var <= 1,
-                                name=(
-                                    f"stack_no_missing_gap_{item_key}_"
-                                    f"{segment_name}_{left_stack}_{right_stack}"
-                                ),
-                            )
-                            break
-                        model.addCons(
-                            left_var + right_var - 1 <= middle_var,
-                            name=(
-                                f"stack_no_gap_{item_key}_{segment_name}_"
-                                f"{left_stack}_{middle_stack}_{right_stack}"
-                            ),
-                        )
+        occupied_atoms.update(option.atoms)
+        bays = _bays_from_bay_spec(option.bay_spec)
+        if group.size == ContainerSize.SIZE_20:
+            used_20ft_bays.update(bays)
+        else:
+            used_large_bays.update(bays)
 
-    def _add_soft_stack_run_constraints(
+        column_key = (option.bay_spec, option.stack_index)
+        if group not in column_groups[column_key]:
+            column_groups[column_key].append(group)
+        column_sizes[column_key] = group.size
+        column_selected_by_tier[column_key][option.tier_index] = group
+
+    @staticmethod
+    def _column_base_tiers(
+        options_by_size: Dict[ContainerSize, List[Stage2PlacementOption]],
+    ) -> Dict[Tuple[BaySpec, int], int]:
+        base_tiers: Dict[Tuple[BaySpec, int], int] = {}
+        for options in options_by_size.values():
+            for option in options:
+                column_key = (option.bay_spec, option.stack_index)
+                current = base_tiers.get(column_key)
+                if current is None or option.tier_index < current:
+                    base_tiers[column_key] = option.tier_index
+        return base_tiers
+
+    def _greedy_item_key(
         self,
-        model: Any,
-        segment_stack_vars: Dict[Tuple[str, BaySpec], Dict[int, Any]],
-        item_segments: Dict[str, Dict[BaySpec, Any]],
-        stack_run_terms: List[Any],
-    ) -> None:
-        """
-        Penalize extra stack runs inside one bay/large-bay segment.
-
-        A single contiguous stack interval has zero extra-run cost. Split shapes
-        like stack 1 + stack 5 pay a soft penalty, so they remain allowed when
-        needed for feasibility but are avoided when compact slots exist.
-        """
-        for (item_key, segment), stack_vars in segment_stack_vars.items():
-            stacks = sorted(int(stack) for stack in stack_vars)
-            if len(stacks) <= 1:
-                continue
-
-            segment_var = item_segments.get(item_key, {}).get(segment)
-            if segment_var is None:
-                continue
-
-            segment_name = self._segment_name(segment)
-            start_terms: List[Any] = []
-            previous_stack: Optional[int] = None
-            previous_var: Optional[Any] = None
-            for stack in stacks:
-                stack_var = stack_vars[stack]
-                start_var = model.addVar(
-                    vtype="B",
-                    name=f"stack_run_start_{item_key}_{segment_name}_{stack}",
-                )
-                if previous_stack is None or previous_var is None or stack != previous_stack + 1:
-                    model.addCons(
-                        start_var >= stack_var,
-                        name=f"stack_run_first_{item_key}_{segment_name}_{stack}",
-                    )
-                else:
-                    model.addCons(
-                        start_var >= stack_var - previous_var,
-                        name=f"stack_run_link_{item_key}_{segment_name}_{stack}",
-                    )
-                model.addCons(
-                    start_var <= stack_var,
-                    name=f"stack_run_active_{item_key}_{segment_name}_{stack}",
-                )
-                start_terms.append(start_var)
-                previous_stack = stack
-                previous_var = stack_var
-
-            extra_runs = model.addVar(
-                vtype="C",
-                lb=0,
-                ub=max(0, len(stacks) - 1),
-                name=f"stack_extra_runs_{item_key}_{segment_name}",
-            )
-            model.addCons(
-                extra_runs >= sum(start_terms) - segment_var,
-                name=f"stack_extra_run_count_{item_key}_{segment_name}",
-            )
-            stack_run_terms.append(extra_runs)
-
-    def _add_soft_isolated_cell_constraints(
-        self,
-        model: Any,
-        segment_stack_vars: Dict[Tuple[str, BaySpec], Dict[int, Any]],
-        item_segments: Dict[str, Dict[BaySpec, Any]],
-        item_keys: List[str],
-        isolated_cell_terms: List[Any],
-    ) -> None:
-        """
-        Penalize selected cells that have no same-group neighbor.
-
-        Neighbor means either adjacent stack in the same bay/large-bay segment,
-        or the same stack position in the previous/next geometric bay segment.
-        This is a soft clustering preference, not a feasibility rule.
-        """
-        per_item: Dict[str, Dict[BaySpec, Dict[int, Any]]] = defaultdict(dict)
-        for (item_key, segment), stack_vars in segment_stack_vars.items():
-            per_item[item_key][segment] = stack_vars
-
-        for item_key in item_keys:
-            segments = per_item.get(item_key, {})
-            if not segments:
-                continue
-
-            ordered_segments = self._ordered_item_segments(item_segments, item_key)
-            segment_position = {
-                segment: index
-                for index, segment in enumerate(ordered_segments)
-            }
-
-            for segment, stack_vars in segments.items():
-                segment_name = self._segment_name(segment)
-                position = segment_position.get(segment)
-                previous_segment = (
-                    ordered_segments[position - 1]
-                    if position is not None and position > 0
-                    else None
-                )
-                next_segment = (
-                    ordered_segments[position + 1]
-                    if position is not None and position + 1 < len(ordered_segments)
-                    else None
-                )
-
-                for stack, stack_var in stack_vars.items():
-                    stack_index = int(stack)
-                    neighbors: List[Any] = []
-                    for adjacent_stack in (stack_index - 1, stack_index + 1):
-                        neighbor = stack_vars.get(adjacent_stack)
-                        if neighbor is not None:
-                            neighbors.append(neighbor)
-                    if previous_segment is not None:
-                        neighbor = segments.get(previous_segment, {}).get(stack_index)
-                        if neighbor is not None:
-                            neighbors.append(neighbor)
-                    if next_segment is not None:
-                        neighbor = segments.get(next_segment, {}).get(stack_index)
-                        if neighbor is not None:
-                            neighbors.append(neighbor)
-
-                    isolated = model.addVar(
-                        vtype="C",
-                        lb=0,
-                        ub=1,
-                        name=f"isolated_cell_{item_key}_{segment_name}_{stack_index}",
-                    )
-                    if neighbors:
-                        model.addCons(
-                            isolated >= stack_var - sum(neighbors),
-                            name=f"isolated_cell_link_{item_key}_{segment_name}_{stack_index}",
-                        )
-                    else:
-                        model.addCons(
-                            isolated >= stack_var,
-                            name=f"isolated_cell_no_neighbor_{item_key}_{segment_name}_{stack_index}",
-                        )
-                    model.addCons(
-                        isolated <= stack_var,
-                        name=f"isolated_cell_active_{item_key}_{segment_name}_{stack_index}",
-                    )
-                    isolated_cell_terms.append(isolated)
-
-    def _add_segment_fill_constraints(
-        self,
-        model: Any,
-        segment_stack_vars: Dict[Tuple[str, BaySpec], Dict[int, Any]],
-        item_segments: Dict[str, Dict[BaySpec, Any]],
-        item_keys: List[str],
-        region_start_terms: List[Any],
-    ) -> None:
-        """
-        Encourage each used bay/large-bay segment to be a real compact block.
-
-        Most used segments must reach a minimum fill depth; only a small number
-        of tail segments may be underfilled. Region starts are penalized so an
-        item can have several blocks, but unnecessary bay-axis fragmentation is
-        discouraged.
-        """
-        min_fill_ratio = max(0.0, min(1.0, self.config.segment_min_fill_ratio))
-        max_underfilled = max(1, int(self.config.max_underfilled_segments_per_item))
-
-        for item_key in item_keys:
-            segments = item_segments.get(item_key, {})
-            if not segments:
-                continue
-
-            underfilled_terms: List[Any] = []
-            for segment, segment_var in segments.items():
-                stack_vars = segment_stack_vars.get((item_key, segment), {})
-                if not stack_vars:
-                    continue
-                capacity = len(stack_vars)
-                threshold = max(1, min(capacity, int(math.ceil(capacity * min_fill_ratio))))
-                underfilled = model.addVar(
-                    vtype="B",
-                    name=f"underfill_{item_key}_{self._segment_name(segment)}",
-                )
-                fill_expr = sum(stack_vars.values())
-                model.addCons(
-                    fill_expr + threshold * underfilled >= threshold * segment_var,
-                    name=f"segment_min_fill_{item_key}_{self._segment_name(segment)}",
-                )
-                model.addCons(
-                    underfilled <= segment_var,
-                    name=f"underfill_active_{item_key}_{self._segment_name(segment)}",
-                )
-                underfilled_terms.append(underfilled)
-
-            if underfilled_terms:
-                model.addCons(
-                    sum(underfilled_terms) <= max_underfilled,
-                    name=f"underfill_limit_{item_key}",
-                )
-
-        self._add_region_start_constraints(
-            model,
-            item_segments,
-            item_keys,
-            region_start_terms,
+        assignment: AreaAssignment,
+        group: AllocationGroup,
+        demand: int,
+    ) -> Tuple[int, int, int, str, int, str, str]:
+        size_priority = {
+            ContainerSize.SIZE_45: 0,
+            ContainerSize.SIZE_40: 1,
+            ContainerSize.SIZE_20: 2,
+        }.get(group.size, 3)
+        return (
+            size_priority,
+            self._weight_rank(group),
+            -int(demand),
+            assignment.yard_area_id,
+            assignment.split_index,
+            group.group_id,
+            assignment.assignment_id,
         )
 
-    def _add_soft_underfilled_segment_constraints(
+    def _log_unmet_diagnostics(
         self,
-        model: Any,
-        segment_stack_vars: Dict[Tuple[str, BaySpec], Dict[int, Any]],
-        item_segments: Dict[str, Dict[BaySpec, Any]],
-        underfilled_segment_terms: List[Any],
+        *,
+        area: YardArea,
+        assignment: AreaAssignment,
+        group: AllocationGroup,
+        demand: int,
+        unmet_count: int,
+        candidate_options: List[Stage2PlacementOption],
+        selected: List[Stage2PlacementOption],
+        status: str,
     ) -> None:
-        """
-        Penalize active bays/pairs that are not filled to their available width.
+        candidate_columns = {
+            (option.bay_spec, option.stack_index)
+            for option in candidate_options
+        }
+        candidate_segments = {option.bay_spec for option in candidate_options}
+        candidate_bays = {
+            bay
+            for option in candidate_options
+            for bay in _bays_from_bay_spec(option.bay_spec)
+        }
+        selected_columns = {
+            (option.bay_spec, option.stack_index)
+            for option in selected
+        }
+        selected_segments = {option.bay_spec for option in selected}
+        tier_counts_by_segment: Dict[BaySpec, int] = defaultdict(int)
+        column_counts_by_segment: Dict[BaySpec, Set[int]] = defaultdict(set)
+        for option in candidate_options:
+            tier_counts_by_segment[option.bay_spec] += 1
+            column_counts_by_segment[option.bay_spec].add(option.stack_index)
 
-        The hard sequential-fill constraint already guarantees that a bay run can
-        only continue after the previous segment is full. This soft term makes the
-        solver prefer one full bay plus one tail over several one-bay tails, while
-        still allowing tail mixing when a group's remaining demand cannot fill a
-        whole bay.
-        """
-        for (item_key, segment), stack_vars in segment_stack_vars.items():
-            segment_var = item_segments.get(item_key, {}).get(segment)
-            if segment_var is None or not stack_vars:
-                continue
-
-            capacity = len(stack_vars)
-            if capacity <= 1:
-                continue
-            underfilled = model.addVar(
-                vtype="B",
-                name=f"underfilled_seg_{item_key}_{self._segment_name(segment)}",
-            )
-            fill_expr = sum(stack_vars.values())
-            model.addCons(
-                fill_expr + capacity * underfilled >= capacity * segment_var,
-                name=f"underfilled_link_{item_key}_{self._segment_name(segment)}",
-            )
-            model.addCons(
-                underfilled <= segment_var,
-                name=f"underfilled_active_{item_key}_{self._segment_name(segment)}",
-            )
-            underfilled_segment_terms.append(underfilled)
-
-    def _add_region_start_constraints(
-        self,
-        model: Any,
-        item_segments: Dict[str, Dict[BaySpec, Any]],
-        item_keys: List[str],
-        region_start_terms: List[Any],
-    ) -> None:
-        """
-        Add soft bay-axis fragmentation counters.
-
-        These variables are only used in the objective, so they prefer compact
-        blocks without preventing use of otherwise valid physical slots.
-        """
-        for item_key in item_keys:
-            segments = item_segments.get(item_key, {})
-            if not segments:
-                continue
-
-            previous_segment_var: Optional[Any] = None
-            for segment in sorted(segments, key=self._bay_spec_sort_key):
-                segment_var = segments[segment]
-                segment_name = self._segment_name(segment)
-                start_var = model.addVar(
-                    vtype="B",
-                    name=f"region_start_{item_key}_{segment_name}",
+        densest_segments = sorted(
+            (
+                (
+                    self._segment_name(segment),
+                    len(column_counts_by_segment[segment]),
+                    tier_count,
                 )
-                if previous_segment_var is None:
-                    model.addCons(
-                        start_var >= segment_var,
-                        name=f"region_first_start_{item_key}_{segment_name}",
-                    )
-                else:
-                    model.addCons(
-                        start_var >= segment_var - previous_segment_var,
-                        name=f"region_start_link_{item_key}_{segment_name}",
-                    )
-                model.addCons(
-                    start_var <= segment_var,
-                    name=f"region_start_active_{item_key}_{segment_name}",
-                )
-                region_start_terms.append(start_var)
-                previous_segment_var = segment_var
-
-    def _add_segment_activation_constraints(
-        self,
-        model: Any,
-        segment_stack_vars: Dict[Tuple[str, BaySpec], Dict[int, Any]],
-        item_segments: Dict[str, Dict[BaySpec, Any]],
-    ) -> None:
-        """
-        Make segment activation exact instead of one-way.
-
-        Existing model only has `x <= y`, so a segment could be marked active for
-        objective bookkeeping without actually placing any stacks in it. For bay-run
-        continuity we need `y` to mean "this segment really has this item".
-        """
-        for item_key, segments in item_segments.items():
-            for segment, segment_var in segments.items():
-                stack_vars = segment_stack_vars.get((item_key, segment), {})
-                if not stack_vars:
-                    model.addCons(
-                        segment_var == 0,
-                        name=f"seg_empty_{item_key}_{self._segment_name(segment)}",
-                    )
-                    continue
-                model.addCons(
-                    segment_var <= sum(stack_vars.values()),
-                    name=f"seg_has_stack_{item_key}_{self._segment_name(segment)}",
-                )
-
-    def _add_bay_run_contiguity_constraints(
-        self,
-        model: Any,
-        item_segments: Dict[str, Dict[BaySpec, Any]],
-        item_keys: List[str],
-    ) -> None:
-        """
-        Each item may occupy at most one contiguous run of feasible bay segments
-        within one yard area.
-
-        The ordering is over feasible segments of the same size in this area, not raw
-        integer bay numbers, so it also works for 40/45ft bay pairs and odd/even bay
-        numbering schemes.
-        """
-        for item_key in item_keys:
-            ordered_segments = self._ordered_item_segments(item_segments, item_key)
-            if len(ordered_segments) <= 1:
-                continue
-
-            start_terms: List[Any] = []
-            previous_var: Optional[Any] = None
-            for segment in ordered_segments:
-                segment_var = item_segments[item_key][segment]
-                start_var = model.addVar(
-                    vtype="B",
-                    name=f"run_start_{item_key}_{self._segment_name(segment)}",
-                )
-                if previous_var is None:
-                    model.addCons(
-                        start_var >= segment_var,
-                        name=f"run_first_start_{item_key}_{self._segment_name(segment)}",
-                    )
-                else:
-                    model.addCons(
-                        start_var >= segment_var - previous_var,
-                        name=f"run_start_link_{item_key}_{self._segment_name(segment)}",
-                    )
-                model.addCons(
-                    start_var <= segment_var,
-                    name=f"run_start_active_{item_key}_{self._segment_name(segment)}",
-                )
-                start_terms.append(start_var)
-                previous_var = segment_var
-
-            model.addCons(
-                sum(start_terms) <= 1,
-                name=f"run_single_component_{item_key}",
-            )
-
-    def _add_sequential_segment_fill_constraints(
-        self,
-        model: Any,
-        segment_stack_vars: Dict[Tuple[str, BaySpec], Dict[int, Any]],
-        item_segments: Dict[str, Dict[BaySpec, Any]],
-        item_keys: List[str],
-    ) -> None:
-        """
-        Within one contiguous bay run, earlier segments must be filled before later
-        ones can open.
-
-        For ordered segments s[i], s[i+1]:
-        if s[i+1] is active then s[i] must either be inactive (meaning the run starts
-        later) or, if active, be fully filled to its physically available capacity.
-        This yields the intended "fill one bay first, then move to adjacent bay"
-        behavior while still respecting actual free-column limits.
-        """
-        for item_key in item_keys:
-            ordered_segments = self._ordered_item_segments(item_segments, item_key)
-            if len(ordered_segments) <= 1:
-                continue
-
-            for previous_segment, next_segment in zip(
-                ordered_segments,
-                ordered_segments[1:],
-            ):
-                previous_var = item_segments[item_key][previous_segment]
-                next_var = item_segments[item_key][next_segment]
-                previous_stack_vars = segment_stack_vars.get((item_key, previous_segment), {})
-                if not previous_stack_vars:
-                    continue
-
-                previous_capacity = len(previous_stack_vars)
-                # If the next segment opens while the previous one is active,
-                # the previous segment must already be completely filled.
-                model.addCons(
-                    sum(previous_stack_vars.values())
-                    >= previous_capacity * (previous_var + next_var - 1),
-                    name=(
-                        f"seg_fill_before_next_{item_key}_"
-                        f"{self._segment_name(previous_segment)}_"
-                        f"{self._segment_name(next_segment)}"
-                    ),
-                )
-
-    def _ordered_item_segments(
-        self,
-        item_segments: Dict[str, Dict[BaySpec, Any]],
-        item_key: str,
-    ) -> List[BaySpec]:
-        """
-        Segment order used by bay-run / sequential-fill constraints.
-
-        After `_inject_geometric_segment_axis`, this list is the full geometric axis
-        for that item's size inside the area (every 20ft bay resp. large-bay pair on
-        the slot list). Segments without any feasible stack for this item keep `y=0`
-        but still occupy their place between neighbors, enforcing true longitudinal
-        contiguity rather than collapsing over missing bays.
-        """
-        return sorted(
-            item_segments.get(item_key, {}),
-            key=self._bay_spec_sort_key,
+                for segment, tier_count in tier_counts_by_segment.items()
+            ),
+            key=lambda item: (-item[2], item[0]),
+        )[:8]
+        logger.warning(
+            "Stage2 unmet diagnostic area=%s group=%s status=%s "
+            "tier_demand=%s unmet=%s container_count=%s assignment_columns=%s "
+            "group_columns=%s size=%s weight=%s candidate_tiers=%s "
+            "candidate_columns=%s candidate_segments=%s candidate_bays=%s "
+            "selected_tiers=%s selected_columns=%s selected_segments=%s "
+            "top_candidate_segments=%s",
+            area.area_id,
+            group.group_id,
+            status,
+            demand,
+            unmet_count,
+            group.container_count,
+            assignment.column_demand,
+            group.column_demand,
+            getattr(group.size, "value", group.size),
+            getattr(group.weight_class, "value", group.weight_class),
+            len(candidate_options),
+            len(candidate_columns),
+            len(candidate_segments),
+            len(candidate_bays),
+            len(selected),
+            len(selected_columns),
+            len(selected_segments),
+            densest_segments,
         )
+
+    def _greedy_option_feasible(
+        self,
+        *,
+        option: Stage2PlacementOption,
+        group: AllocationGroup,
+        occupied_atoms: Set[Atom],
+        used_20ft_bays: Set[int],
+        used_large_bays: Set[int],
+        column_groups: Dict[Tuple[BaySpec, int], List[AllocationGroup]],
+        column_sizes: Dict[Tuple[BaySpec, int], ContainerSize],
+        column_selected_by_tier: Dict[Tuple[BaySpec, int], Dict[int, AllocationGroup]],
+        column_base_tiers: Optional[Dict[Tuple[BaySpec, int], int]] = None,
+    ) -> bool:
+        if any(atom in occupied_atoms for atom in option.atoms):
+            return False
+
+        bays = set(_bays_from_bay_spec(option.bay_spec))
+        if group.size == ContainerSize.SIZE_20:
+            if bays & used_large_bays:
+                return False
+        elif bays & used_20ft_bays:
+            return False
+
+        column_key = (option.bay_spec, option.stack_index)
+        existing_size = column_sizes.get(column_key)
+        if existing_size is not None and existing_size != group.size:
+            return False
+
+        for existing_group in column_groups.get(column_key, []):
+            if not self._groups_column_compatible(group, existing_group):
+                return False
+
+        tiers = column_selected_by_tier.get(column_key, {})
+        base_tier = (
+            column_base_tiers.get(column_key, option.tier_index)
+            if column_base_tiers is not None
+            else min(set(tiers) | {option.tier_index})
+        )
+        if not self._tier_continuity_preserved(
+            existing_tiers=set(tiers),
+            new_tier=option.tier_index,
+            base_tier=base_tier,
+        ):
+            return False
+
+        group_rank = self._weight_rank(group)
+        for tier, existing_group in tiers.items():
+            existing_rank = self._weight_rank(existing_group)
+            if group_rank > existing_rank and option.tier_index < tier:
+                return False
+            if group_rank < existing_rank and option.tier_index > tier:
+                return False
+        return True
+
+    @staticmethod
+    def _tier_continuity_preserved(
+        *,
+        existing_tiers: Set[int],
+        new_tier: int,
+        base_tier: int,
+    ) -> bool:
+        planned = set(int(tier) for tier in existing_tiers)
+        planned.add(int(new_tier))
+        if not planned:
+            return True
+
+        lowest = min(planned)
+        highest = max(planned)
+        if lowest != int(base_tier):
+            return False
+        return planned == set(range(lowest, highest + 1))
+
+    @staticmethod
+    def _greedy_option_key(
+        option: Stage2PlacementOption,
+        selected: List[Stage2PlacementOption],
+    ) -> Tuple[int, int, int, int, Tuple[int, int]]:
+        selected_columns = {
+            (item.bay_spec, item.stack_index)
+            for item in selected
+        }
+        selected_segments = {item.bay_spec for item in selected}
+        column_open = 0 if (option.bay_spec, option.stack_index) in selected_columns else 1
+        segment_open = 0 if option.bay_spec in selected_segments else 1
+        return (
+            segment_open,
+            column_open,
+            option.rank,
+            option.stack_index,
+            ScipStage2BayAllocator._bay_spec_sort_key(option.bay_spec),
+        )
+
+    @classmethod
+    def _groups_column_compatible(
+        cls,
+        group_a: AllocationGroup,
+        group_b: AllocationGroup,
+    ) -> bool:
+        if group_a.size != group_b.size:
+            return False
+        hard_fields = (
+            "business_type",
+            "container_type",
+            "voyage_id",
+            "line_key",
+        )
+        for field_name in hard_fields:
+            value_a = cls._normalise_share_value(getattr(group_a, field_name, None))
+            value_b = cls._normalise_share_value(getattr(group_b, field_name, None))
+            if cls._values_conflict(value_a, value_b):
+                return False
+
+        signature_a = dict(cls._container_attribute_signature(group_a))
+        signature_b = dict(cls._container_attribute_signature(group_b))
+        attr_a = dict(cls._group_attribute_signature(group_a.group_attributes))
+        attr_b = dict(cls._group_attribute_signature(group_b.group_attributes))
+        for key in set(signature_a) | set(signature_b):
+            if cls._values_conflict(signature_a.get(key), signature_b.get(key)):
+                return False
+        for key in set(attr_a) | set(attr_b):
+            if cls._values_conflict(attr_a.get(key), attr_b.get(key)):
+                return False
+        return True
+
+    @staticmethod
+    def _values_conflict(value_a: Any, value_b: Any) -> bool:
+        if value_a in (None, "", (), frozenset()):
+            return False
+        if value_b in (None, "", (), frozenset()):
+            return False
+        return value_a != value_b
 
     def _build_options(
         self,
@@ -1000,26 +687,36 @@ class ScipStage2BayAllocator:
             bay = int(slot["bay_number"])
             if bay in existing_large_bays:
                 continue
-            single_slots.append(slot)
-            single_capacity_by_bay[bay] += 1
+            slot_with_tiers = dict(slot)
+            tiers = self._slot_tiers(slot_with_tiers, area.max_stack_height)
+            if not tiers:
+                continue
+            slot_with_tiers["tiers"] = tiers
+            single_slots.append(slot_with_tiers)
+            single_capacity_by_bay[bay] += len(tiers)
         max_single_capacity = max(single_capacity_by_bay.values(), default=1)
 
         for rank, slot in enumerate(single_slots):
             bay = int(slot["bay_number"])
             stack = int(slot["stack_index"])
             segment_capacity = max(1, single_capacity_by_bay.get(bay, 0))
-            options[ContainerSize.SIZE_20].append(
-                Stage2PlacementOption(
-                    option_id=f"s20_{bay}_{stack}",
-                    bay_spec=bay,
-                    atoms=((bay, stack),),
-                    stack_index=stack,
-                    zone=zone_by_bay.get(bay, "B"),
-                    rank=rank,
-                    segment_capacity=segment_capacity,
-                    segment_scarcity_cost=max(0.0, float(max_single_capacity - segment_capacity)),
+            for tier in self._slot_tiers(slot, area.max_stack_height):
+                options[ContainerSize.SIZE_20].append(
+                    Stage2PlacementOption(
+                        option_id=f"s20_{bay}_{stack}_{tier}",
+                        bay_spec=bay,
+                        atoms=((bay, stack, tier),),
+                        stack_index=stack,
+                        tier_index=tier,
+                        zone=zone_by_bay.get(bay, "B"),
+                        rank=rank,
+                        segment_capacity=segment_capacity,
+                        segment_scarcity_cost=max(
+                            0.0,
+                            float(max_single_capacity - segment_capacity),
+                        ),
+                    )
                 )
-            )
 
         large_slots: List[Dict[str, Any]] = []
         large_capacity_by_segment: Dict[BaySpec, int] = defaultdict(int)
@@ -1030,180 +727,78 @@ class ScipStage2BayAllocator:
             if set(bay_numbers) & existing_large_bays:
                 continue
             display_bays = tuple(int(value) for value in slot.get("display_bays", bay_numbers))
-            large_slots.append(slot)
-            large_capacity_by_segment[display_bays] += 1
+            slot_with_tiers = dict(slot)
+            tiers = self._slot_tiers(slot_with_tiers, area.max_stack_height)
+            if not tiers:
+                continue
+            slot_with_tiers["tiers"] = tiers
+            large_slots.append(slot_with_tiers)
+            large_capacity_by_segment[display_bays] += len(tiers)
         max_large_capacity = max(large_capacity_by_segment.values(), default=1)
 
         for rank, slot in enumerate(large_slots):
             bay_numbers = tuple(int(value) for value in slot["bay_numbers"])
             display_bays = tuple(int(value) for value in slot.get("display_bays", bay_numbers))
             stack = int(slot["stack_index"])
-            atoms = tuple((bay, stack) for bay in bay_numbers)
             zone = self._option_zone(bay_numbers, zone_by_bay)
             segment_capacity = max(1, large_capacity_by_segment.get(display_bays, 0))
             segment_scarcity_cost = max(0.0, float(max_large_capacity - segment_capacity))
-            option = Stage2PlacementOption(
-                option_id=f"l40_{display_bays[0]}_{display_bays[1]}_{stack}_{rank}",
-                bay_spec=display_bays,
-                atoms=atoms,
-                stack_index=stack,
-                zone=zone,
-                rank=rank,
-                segment_capacity=segment_capacity,
-                segment_scarcity_cost=segment_scarcity_cost,
-            )
-            options[ContainerSize.SIZE_40].append(option)
-            if bool(slot.get("is_edge_pair")):
-                options[ContainerSize.SIZE_45].append(
-                    Stage2PlacementOption(
-                        option_id=f"l45_{display_bays[0]}_{display_bays[1]}_{stack}_{rank}",
-                        bay_spec=display_bays,
-                        atoms=atoms,
-                        stack_index=stack,
-                        zone=zone,
-                        rank=rank,
-                        segment_capacity=segment_capacity,
-                        segment_scarcity_cost=segment_scarcity_cost,
-                    )
+            for tier in self._slot_tiers(slot, area.max_stack_height):
+                atoms = tuple((bay, stack, tier) for bay in bay_numbers)
+                option = Stage2PlacementOption(
+                    option_id=(
+                        f"l40_{display_bays[0]}_{display_bays[1]}_"
+                        f"{stack}_{tier}_{rank}"
+                    ),
+                    bay_spec=display_bays,
+                    atoms=atoms,
+                    stack_index=stack,
+                    tier_index=tier,
+                    zone=zone,
+                    rank=rank,
+                    segment_capacity=segment_capacity,
+                    segment_scarcity_cost=segment_scarcity_cost,
                 )
+                options[ContainerSize.SIZE_40].append(option)
+                if bool(slot.get("is_edge_pair")):
+                    options[ContainerSize.SIZE_45].append(
+                        Stage2PlacementOption(
+                            option_id=(
+                                f"l45_{display_bays[0]}_{display_bays[1]}_"
+                                f"{stack}_{tier}_{rank}"
+                            ),
+                            bay_spec=display_bays,
+                            atoms=atoms,
+                            stack_index=stack,
+                            tier_index=tier,
+                            zone=zone,
+                            rank=rank,
+                            segment_capacity=segment_capacity,
+                            segment_scarcity_cost=segment_scarcity_cost,
+                        )
+                    )
 
         for size in options:
-            options[size].sort(key=lambda option: (option.rank, option.stack_index, option.bay_spec))
-        return dict(options)
-
-    def _canonical_20ft_segments(self, area: YardArea) -> List[int]:
-        """
-        Full longitudinal axis for **20ft (小贝)**: every `Bay` in this area that is not
-        part of a large-bay pair (`is_in_large_bay` is False), excluding bays blocked
-        for large-container locks.
-
-        We must **not** derive this only from `_stage2_single_slots`, because that list
-        only contains bays that currently have an *empty* 20ft column in the TOS
-        snapshot. Missing intermediate bays would collapse the axis and make hard
-        contiguity allow ``46,51,56``-style jumps.
-
-        When `area.bays` is empty (synthetic tests), fall back to unique bays from
-        `_single_slots`, matching `_build_options`.
-        """
-        existing_large_bays = set(getattr(area, "_stage2_existing_large_bays", set()))
-        structural: List[int] = []
-        for bay in sorted(area.bays, key=lambda b: b.bay_number):
-            if bay.bay_number in existing_large_bays:
-                continue
-            if getattr(bay, "is_in_large_bay", False):
-                continue
-            if bay.size_lock not in (None, ContainerSize.SIZE_20):
-                continue
-            structural.append(int(bay.bay_number))
-        if structural:
-            return structural
-
-        bays_sparse: Set[int] = set()
-        for slot in self._single_slots(area):
-            bay = int(slot["bay_number"])
-            if bay in existing_large_bays:
-                continue
-            bays_sparse.add(bay)
-        return sorted(bays_sparse)
-
-    def _canonical_large_segments(self, area: YardArea, size: ContainerSize) -> List[BaySpec]:
-        """
-        Full axis for **40/45ft (大贝对)**: every `LargeBayPair` in the area, with the
-        same `existing_*` bay filters as `_build_options`. 45ft only uses edge pairs.
-
-        Using `area.large_bay_pairs` keeps adjacency along **pair sequence**, not a
-        sparse subset of pairs that happen to have an empty 40ft column right now.
-        """
-        if size not in (ContainerSize.SIZE_40, ContainerSize.SIZE_45):
-            return []
-        existing_20ft_bays = set(getattr(area, "_stage2_existing_20ft_bays", set()))
-        existing_large_bays = set(getattr(area, "_stage2_existing_large_bays", set()))
-        ordered: List[BaySpec] = []
-        seen_normalized: Set[Tuple[int, int]] = set()
-
-        if area.large_bay_pairs:
-            for pair in sorted(
-                area.large_bay_pairs,
-                key=lambda p: (p.bay_a.bay_number, p.bay_b.bay_number),
-            ):
-                if size == ContainerSize.SIZE_45 and not pair.is_edge_pair:
-                    continue
-                ba = int(pair.bay_a.bay_number)
-                bb = int(pair.bay_b.bay_number)
-                if {ba, bb} & existing_20ft_bays:
-                    continue
-                if {ba, bb} & existing_large_bays:
-                    continue
-                norm_key = (min(ba, bb), max(ba, bb))
-                if norm_key in seen_normalized:
-                    continue
-                seen_normalized.add(norm_key)
-                spec: BaySpec = (ba, bb)
-                ordered.append(spec)
-            return sorted(ordered, key=self._bay_spec_sort_key)
-
-        for slot in self._large_slots(area):
-            bay_numbers = tuple(int(value) for value in slot["bay_numbers"])
-            if set(bay_numbers) & existing_20ft_bays:
-                continue
-            if set(bay_numbers) & existing_large_bays:
-                continue
-            display_bays = tuple(int(value) for value in slot.get("display_bays", bay_numbers))
-            if size == ContainerSize.SIZE_45 and not bool(slot.get("is_edge_pair")):
-                continue
-            ba, bb = int(display_bays[0]), int(display_bays[1])
-            norm_key = (min(ba, bb), max(ba, bb))
-            if norm_key in seen_normalized:
-                continue
-            seen_normalized.add(norm_key)
-            ordered.append(display_bays)
-        return sorted(ordered, key=self._bay_spec_sort_key)
-
-    def _inject_geometric_segment_axis(
-        self,
-        model: Any,
-        area: YardArea,
-        item_keys: List[str],
-        items: List[Tuple[AreaAssignment, AllocationGroup]],
-        y: Dict[Tuple[str, BaySpec], Any],
-        item_segments: Dict[str, Dict[BaySpec, Any]],
-    ) -> None:
-        """
-        Pad `item_segments` with every geometric segment on the sizing axis inside this area.
-
-        Without this padding, bays that currently have zero candidate stacks for some item
-        are omitted entirely, so contiguous-run constraints incorrectly treat `39,43,47`
-        as adjacent.
-        """
-        axis_20 = self._canonical_20ft_segments(area)
-        axis_40 = self._canonical_large_segments(area, ContainerSize.SIZE_40)
-        axis_45 = self._canonical_large_segments(area, ContainerSize.SIZE_45)
-
-        for item_key, (_assignment, group) in zip(item_keys, items):
-            if group.size == ContainerSize.SIZE_20:
-                axis_segments: Iterable[BaySpec] = axis_20
-            elif group.size == ContainerSize.SIZE_45:
-                axis_segments = axis_45
-            elif group.size == ContainerSize.SIZE_40:
-                axis_segments = axis_40
-            else:
-                axis_segments = []
-            for seg in axis_segments:
-                if seg in item_segments[item_key]:
-                    continue
-                segment_var = model.addVar(
-                    vtype="B",
-                    name=f"seg_{item_key}_{self._segment_name(seg)}_geom",
+            options[size].sort(
+                key=lambda option: (
+                    option.rank,
+                    option.stack_index,
+                    option.tier_index,
+                    option.bay_spec,
                 )
-                y[(item_key, seg)] = segment_var
-                item_segments[item_key][seg] = segment_var
+            )
+        return dict(options)
 
     def _single_slots(self, area: YardArea) -> List[Dict[str, int]]:
         explicit = getattr(area, "_stage2_single_slots", None)
         if explicit is not None:
             return sorted(
                 explicit,
-                key=lambda slot: (int(slot["bay_number"]), int(slot["stack_index"])),
+                key=lambda slot: (
+                    int(slot["bay_number"]),
+                    int(slot["stack_index"]),
+                    min(self._slot_tiers(slot, area.max_stack_height), default=1),
+                ),
             )
 
         slots: List[Dict[str, int]] = []
@@ -1211,7 +806,13 @@ class ScipStage2BayAllocator:
             if not bay.can_accept_20ft():
                 continue
             for stack in range(1, bay.free_columns + 1):
-                slots.append({"bay_number": bay.bay_number, "stack_index": stack})
+                slots.append(
+                    {
+                        "bay_number": bay.bay_number,
+                        "stack_index": stack,
+                        "tiers": list(range(1, area.max_stack_height + 1)),
+                    }
+                )
         return slots
 
     def _large_slots(self, area: YardArea) -> List[Dict[str, Any]]:
@@ -1222,6 +823,7 @@ class ScipStage2BayAllocator:
                 key=lambda slot: (
                     tuple(int(value) for value in slot["display_bays"]),
                     int(slot["stack_index"]),
+                    min(self._slot_tiers(slot, area.max_stack_height), default=1),
                 ),
             )
 
@@ -1238,23 +840,27 @@ class ScipStage2BayAllocator:
                         "bay_numbers": bay_numbers,
                         "display_bays": bay_numbers,
                         "stack_index": stack,
+                        "tiers": list(range(1, area.max_stack_height + 1)),
                         "is_edge_pair": pair.is_edge_pair,
                     }
                 )
         return slots
 
-    def _available_atoms_by_bay(
-        self,
-        options_by_size: Dict[ContainerSize, List[Stage2PlacementOption]],
-    ) -> Dict[int, set]:
-        atoms_by_bay: Dict[int, set] = defaultdict(set)
-        for option in options_by_size.get(ContainerSize.SIZE_20, []):
-            for atom in option.atoms:
-                atoms_by_bay[atom[0]].add(atom)
-        for option in options_by_size.get(ContainerSize.SIZE_40, []):
-            for atom in option.atoms:
-                atoms_by_bay[atom[0]].add(atom)
-        return atoms_by_bay
+    @staticmethod
+    def _slot_tiers(slot: Dict[str, Any], max_stack_height: int) -> List[int]:
+        raw_tiers = slot.get("tiers")
+        if raw_tiers:
+            tiers = [
+                int(tier)
+                for tier in raw_tiers
+                if 1 <= int(tier) <= int(max_stack_height)
+            ]
+            return sorted(set(tiers))
+
+        tier = int(slot.get("tier_index", 1) or 1)
+        if tier < 1 or tier > int(max_stack_height):
+            return []
+        return [tier]
 
     def _crane_zones(self, area: YardArea) -> Dict[int, str]:
         bay_numbers = sorted(
@@ -1295,11 +901,18 @@ class ScipStage2BayAllocator:
         unmet_count: int,
         status: str,
     ) -> BayColumnAllocation:
-        grouped: Dict[BaySpec, int] = defaultdict(int)
-        stacks_by_segment: Dict[BaySpec, List[int]] = defaultdict(list)
+        stacks_by_segment: Dict[BaySpec, Set[int]] = defaultdict(set)
+        tiers_by_column: Dict[Tuple[BaySpec, int], List[int]] = defaultdict(list)
         for option in selected:
-            grouped[option.bay_spec] += 1
-            stacks_by_segment[option.bay_spec].append(option.stack_index)
+            stacks_by_segment[option.bay_spec].add(option.stack_index)
+            tiers_by_column[(option.bay_spec, option.stack_index)].append(
+                option.tier_index
+            )
+
+        grouped = {
+            bay_spec: len(stacks)
+            for bay_spec, stacks in stacks_by_segment.items()
+        }
 
         details = [
             (bay_spec, grouped[bay_spec])
@@ -1309,23 +922,29 @@ class ScipStage2BayAllocator:
             (bay_spec, start_stack, end_stack)
             for bay_spec in sorted(stacks_by_segment, key=self._bay_spec_sort_key)
             for start_stack, end_stack in self._contiguous_ranges(
-                stacks_by_segment[bay_spec]
+                list(stacks_by_segment[bay_spec])
             )
         ]
-        placed = sum(grouped.values())
+        placed = len(selected)
         exact = "; ".join(
-            f"{bay_spec}: stacks {self._format_stack_ranges(stacks)}"
-            for bay_spec, stacks in sorted(stacks_by_segment.items(), key=lambda item: self._bay_spec_sort_key(item[0]))
-            if stacks
+            f"{bay_spec}: stack {stack} tiers {self._format_stack_ranges(tiers)}"
+            for (bay_spec, stack), tiers in sorted(
+                tiers_by_column.items(),
+                key=lambda item: (
+                    self._bay_spec_sort_key(item[0][0]),
+                    int(item[0][1]),
+                ),
+            )
         )
         notes = [
-            f"SCIP stage2 status={status}",
+            f"greedy stage2 status={status}",
             f"placed={placed}/{demand}",
+            f"columns={sum(grouped.values())}",
         ]
         if unmet_count > 0:
             notes.append(f"unmet={unmet_count}")
             logger.warning(
-                f"Stage2 SCIP area {area.area_id} group {group.group_id} "
+                f"Stage2 greedy area {area.area_id} group {group.group_id} "
                 f"placed {placed}/{demand}, unmet {unmet_count}"
             )
         if exact:
@@ -1351,6 +970,123 @@ class ScipStage2BayAllocator:
             f"{index}_{assignment.group_id}_{assignment.split_index}_"
             f"{assignment.assignment_id}"
         ).replace("-", "_")
+
+    @staticmethod
+    def _tier_demand(assignment: AreaAssignment, group: AllocationGroup) -> int:
+        container_count = max(0, int(group.container_count or len(group.containers) or 0))
+        if container_count <= 0:
+            return max(0, int(assignment.column_demand))
+
+        group_columns = max(0, int(group.column_demand or 0))
+        assigned_columns = max(0, int(assignment.column_demand or 0))
+        if group_columns > 0 and assigned_columns > 0 and assigned_columns < group_columns:
+            return max(1, int(round(container_count * assigned_columns / group_columns)))
+        return container_count
+
+    @classmethod
+    def _container_attribute_signature(cls, group: AllocationGroup) -> Tuple[Any, ...]:
+        if not group.containers:
+            return ()
+        fields = (
+            "iso_type",
+            "category",
+            "pod",
+            "cattier_kind",
+            "trade_code",
+            "service_line_code",
+            "freight_kind",
+            "owner_company",
+            "line_company",
+            "truck_company",
+            "belonger_company",
+            "work_type",
+            "bol",
+            "damage_code",
+            "is_reefer",
+            "is_hazardous",
+            "is_damage",
+            "is_high",
+            "is_gauge",
+            "is_dirty",
+        )
+        signature: List[Any] = []
+        for field_name in fields:
+            values = frozenset(
+                cls._normalise_share_value(getattr(container, field_name, None))
+                for container in group.containers
+                if cls._normalise_share_value(getattr(container, field_name, None))
+                not in (None, "", (), frozenset())
+            )
+            if values:
+                signature.append((field_name, values))
+        return tuple(signature)
+
+    @classmethod
+    def _group_attribute_signature(cls, attributes: Dict[str, Any]) -> Tuple[Any, ...]:
+        ignored = {
+            "weightClass",
+            "weight_class",
+            "weightMin",
+            "weightMax",
+            "weight_min",
+            "weight_max",
+            "filterName",
+        }
+
+        def flatten(prefix: str, value: Any) -> List[Tuple[str, Any]]:
+            leaf_key = prefix.rsplit(".", 1)[-1]
+            if prefix in ignored or leaf_key in ignored:
+                return []
+            if value in (None, ""):
+                return []
+            if isinstance(value, dict):
+                entries: List[Tuple[str, Any]] = []
+                for key in sorted(value):
+                    child_prefix = str(key) if not prefix else f"{prefix}.{key}"
+                    entries.extend(flatten(child_prefix, value[key]))
+                return entries
+            normalised = cls._normalise_share_value(value)
+            if normalised in (None, "", (), frozenset()):
+                return []
+            return [(prefix, normalised)]
+
+        entries: List[Tuple[str, Any]] = []
+        for key in sorted(attributes):
+            entries.extend(flatten(str(key), attributes[key]))
+        return tuple(entries)
+
+    @staticmethod
+    def _normalise_share_value(value: Any) -> Any:
+        if value in (None, ""):
+            return None
+        if isinstance(value, list):
+            return tuple(
+                item
+                for item in (ScipStage2BayAllocator._normalise_share_value(v) for v in value)
+                if item not in (None, "")
+            )
+        if isinstance(value, set):
+            return frozenset(
+                item
+                for item in (ScipStage2BayAllocator._normalise_share_value(v) for v in value)
+                if item not in (None, "")
+            )
+        if hasattr(value, "value"):
+            return value.value
+        return value
+
+    @staticmethod
+    def _weight_rank(group: AllocationGroup) -> int:
+        value = group.weight_class
+        raw = value.value if hasattr(value, "value") else value
+        return {
+            "empty": 0,
+            "light": 1,
+            "heavy": 2,
+            0: 0,
+            1: 1,
+            2: 2,
+        }.get(raw, 1)
 
     @staticmethod
     def _segment_name(segment: BaySpec) -> str:
