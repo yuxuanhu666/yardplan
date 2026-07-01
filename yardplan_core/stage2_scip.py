@@ -14,6 +14,10 @@ from yardplan_core.models import (
     YardArea,
     logger,
 )
+from yardplan_core.simultaneous import (
+    groups_have_simultaneous_loading_conflict,
+    simultaneous_loading_safety_gap_bays,
+)
 
 Atom = Tuple[int, int, int]
 BaySpec = Any
@@ -189,6 +193,8 @@ class Stage2PlacementOption:
     rank: int
     segment_capacity: int = 1
     segment_scarcity_cost: float = 0.0
+    column_occupied_tiers: int = 0
+    segment_occupied_tiers: int = 0
 
 
 @dataclass
@@ -222,6 +228,7 @@ class Stage2ScipConfig:
     isolated_cell_weight: float = 0.0
     underfilled_segment_weight: float = 0.0
     soft_geometric_region_axis: bool = True
+    simultaneous_loading_min_bay_gap: int = 4
 
 
 class ScipStage2BayAllocator:
@@ -235,6 +242,9 @@ class ScipStage2BayAllocator:
 
     def __init__(self, config: Optional[Stage2ScipConfig] = None):
         self.config = config or Stage2ScipConfig()
+        self.placement_progress: List[Dict[str, Any]] = []
+        self._progress_global_demand = 0
+        self._progress_global_placed = 0
 
     def allocate(
         self,
@@ -242,12 +252,21 @@ class ScipStage2BayAllocator:
         groups: Dict[str, AllocationGroup],
         yard_areas: Dict[str, YardArea],
     ) -> List[BayColumnAllocation]:
+        self.placement_progress = []
+        self._progress_global_demand = 0
+        self._progress_global_placed = 0
         by_area: Dict[str, List[Tuple[AreaAssignment, AllocationGroup]]] = defaultdict(list)
         for assignment in area_assignments:
             group = groups.get(assignment.group_id)
             if group is None or assignment.yard_area_id not in yard_areas:
                 continue
             by_area[assignment.yard_area_id].append((assignment, group))
+
+        self._progress_global_demand = sum(
+            max(0, self._tier_demand(assignment, group))
+            for items in by_area.values()
+            for assignment, group in items
+        )
 
         allocations: List[BayColumnAllocation] = []
         for area_id in sorted(by_area):
@@ -305,6 +324,7 @@ class ScipStage2BayAllocator:
             Tuple[BaySpec, int],
             Dict[int, AllocationGroup],
         ] = defaultdict(dict)
+        selected_options_by_group: List[Tuple[AllocationGroup, Stage2PlacementOption]] = []
 
         item_contexts = [
             (
@@ -315,6 +335,11 @@ class ScipStage2BayAllocator:
             )
             for item_key, (assignment, group) in zip(item_keys, items)
         ]
+        area_total_demand = sum(
+            max(0, demand)
+            for _item_key, _assignment, _group, demand in item_contexts
+        )
+        area_placed = 0
         placement_order = sorted(
             item_contexts,
             key=lambda item: self._greedy_item_key(item[1], item[2], item[3]),
@@ -349,6 +374,7 @@ class ScipStage2BayAllocator:
                         column_sizes=column_sizes,
                         column_selected_by_tier=column_selected_by_tier,
                         column_base_tiers=column_base_tiers,
+                        selected_options_by_group=selected_options_by_group,
                     ):
                         continue
                     choice = option
@@ -368,6 +394,30 @@ class ScipStage2BayAllocator:
                     column_groups=column_groups,
                     column_sizes=column_sizes,
                     column_selected_by_tier=column_selected_by_tier,
+                )
+                selected_options_by_group.append((group, choice))
+                area_placed += 1
+                self._progress_global_placed += 1
+                self.placement_progress.append(
+                    {
+                        "step": len(self.placement_progress) + 1,
+                        "areaId": area.area_id,
+                        "groupId": group.group_id,
+                        "businessType": getattr(group.business_type, "value", group.business_type),
+                        "size": getattr(group.size, "value", group.size),
+                        "baySpec": choice.bay_spec,
+                        "stackIndex": choice.stack_index,
+                        "tier": choice.tier_index,
+                        "areaPlaced": area_placed,
+                        "areaDemand": area_total_demand,
+                        "areaRemaining": max(0, area_total_demand - area_placed),
+                        "globalPlaced": self._progress_global_placed,
+                        "globalDemand": self._progress_global_demand,
+                        "globalRemaining": max(
+                            0,
+                            self._progress_global_demand - self._progress_global_placed,
+                        ),
+                    }
                 )
 
             if len(selected) < demand:
@@ -552,6 +602,9 @@ class ScipStage2BayAllocator:
         column_sizes: Dict[Tuple[BaySpec, int], ContainerSize],
         column_selected_by_tier: Dict[Tuple[BaySpec, int], Dict[int, AllocationGroup]],
         column_base_tiers: Optional[Dict[Tuple[BaySpec, int], int]] = None,
+        selected_options_by_group: Optional[
+            List[Tuple[AllocationGroup, Stage2PlacementOption]]
+        ] = None,
     ) -> bool:
         if any(atom in occupied_atoms for atom in option.atoms):
             return False
@@ -561,6 +614,13 @@ class ScipStage2BayAllocator:
             if bays & used_large_bays:
                 return False
         elif bays & used_20ft_bays:
+            return False
+
+        if not self._simultaneous_loading_gap_feasible(
+            option=option,
+            group=group,
+            selected_options_by_group=selected_options_by_group or [],
+        ):
             return False
 
         column_key = (option.bay_spec, option.stack_index)
@@ -594,6 +654,26 @@ class ScipStage2BayAllocator:
                 return False
         return True
 
+    def _simultaneous_loading_gap_feasible(
+        self,
+        *,
+        option: Stage2PlacementOption,
+        group: AllocationGroup,
+        selected_options_by_group: List[Tuple[AllocationGroup, Stage2PlacementOption]],
+    ) -> bool:
+        default_gap = max(0, int(self.config.simultaneous_loading_min_bay_gap or 0))
+        if default_gap <= 0:
+            return True
+        for existing_group, existing_option in selected_options_by_group:
+            if not groups_have_simultaneous_loading_conflict(group, existing_group):
+                continue
+            group_gap = simultaneous_loading_safety_gap_bays(group, default_gap)
+            existing_gap = simultaneous_loading_safety_gap_bays(existing_group, default_gap)
+            min_gap = max(int(group_gap or 0), int(existing_gap or 0), default_gap)
+            if self._bay_gap_between_specs(option.bay_spec, existing_option.bay_spec) < min_gap:
+                return False
+        return True
+
     @staticmethod
     def _tier_continuity_preserved(
         *,
@@ -612,11 +692,11 @@ class ScipStage2BayAllocator:
             return False
         return planned == set(range(lowest, highest + 1))
 
-    @staticmethod
     def _greedy_option_key(
+        self,
         option: Stage2PlacementOption,
         selected: List[Stage2PlacementOption],
-    ) -> Tuple[int, int, int, int, Tuple[int, int]]:
+    ) -> Tuple[int, int, int, float, int, int, int, Tuple[int, int], int]:
         selected_columns = {
             (item.bay_spec, item.stack_index)
             for item in selected
@@ -626,10 +706,14 @@ class ScipStage2BayAllocator:
         segment_open = 0 if option.bay_spec in selected_segments else 1
         return (
             segment_open,
+            option.segment_occupied_tiers,
+            option.column_occupied_tiers,
+            option.segment_scarcity_cost,
             column_open,
             option.rank,
             option.stack_index,
             ScipStage2BayAllocator._bay_spec_sort_key(option.bay_spec),
+            option.tier_index,
         )
 
     @classmethod
@@ -683,6 +767,8 @@ class ScipStage2BayAllocator:
 
         single_slots: List[Dict[str, int]] = []
         single_capacity_by_bay: Dict[int, int] = defaultdict(int)
+        single_fallback_occupied_by_bay: Dict[int, int] = defaultdict(int)
+        single_explicit_occupied_by_bay: Dict[int, int] = {}
         for slot in self._single_slots(area):
             bay = int(slot["bay_number"])
             if bay in existing_large_bays:
@@ -692,6 +778,20 @@ class ScipStage2BayAllocator:
             if not tiers:
                 continue
             slot_with_tiers["tiers"] = tiers
+            slot_with_tiers["column_occupied_tiers"] = self._slot_occupied_tiers(
+                slot_with_tiers,
+                area.max_stack_height,
+            )
+            explicit_segment_occupied = self._slot_segment_occupied_tiers(slot_with_tiers)
+            if explicit_segment_occupied is None:
+                single_fallback_occupied_by_bay[bay] += int(
+                    slot_with_tiers["column_occupied_tiers"]
+                )
+            else:
+                single_explicit_occupied_by_bay[bay] = max(
+                    single_explicit_occupied_by_bay.get(bay, 0),
+                    explicit_segment_occupied,
+                )
             single_slots.append(slot_with_tiers)
             single_capacity_by_bay[bay] += len(tiers)
         max_single_capacity = max(single_capacity_by_bay.values(), default=1)
@@ -700,6 +800,10 @@ class ScipStage2BayAllocator:
             bay = int(slot["bay_number"])
             stack = int(slot["stack_index"])
             segment_capacity = max(1, single_capacity_by_bay.get(bay, 0))
+            segment_occupied_tiers = single_explicit_occupied_by_bay.get(
+                bay,
+                single_fallback_occupied_by_bay.get(bay, 0),
+            )
             for tier in self._slot_tiers(slot, area.max_stack_height):
                 options[ContainerSize.SIZE_20].append(
                     Stage2PlacementOption(
@@ -715,11 +819,15 @@ class ScipStage2BayAllocator:
                             0.0,
                             float(max_single_capacity - segment_capacity),
                         ),
+                        column_occupied_tiers=int(slot.get("column_occupied_tiers") or 0),
+                        segment_occupied_tiers=int(segment_occupied_tiers),
                     )
                 )
 
         large_slots: List[Dict[str, Any]] = []
         large_capacity_by_segment: Dict[BaySpec, int] = defaultdict(int)
+        large_fallback_occupied_by_segment: Dict[BaySpec, int] = defaultdict(int)
+        large_explicit_occupied_by_segment: Dict[BaySpec, int] = {}
         for slot in self._large_slots(area):
             bay_numbers = tuple(int(value) for value in slot["bay_numbers"])
             if set(bay_numbers) & existing_20ft_bays:
@@ -732,6 +840,20 @@ class ScipStage2BayAllocator:
             if not tiers:
                 continue
             slot_with_tiers["tiers"] = tiers
+            slot_with_tiers["column_occupied_tiers"] = self._slot_occupied_tiers(
+                slot_with_tiers,
+                area.max_stack_height,
+            )
+            explicit_segment_occupied = self._slot_segment_occupied_tiers(slot_with_tiers)
+            if explicit_segment_occupied is None:
+                large_fallback_occupied_by_segment[display_bays] += int(
+                    slot_with_tiers["column_occupied_tiers"]
+                )
+            else:
+                large_explicit_occupied_by_segment[display_bays] = max(
+                    large_explicit_occupied_by_segment.get(display_bays, 0),
+                    explicit_segment_occupied,
+                )
             large_slots.append(slot_with_tiers)
             large_capacity_by_segment[display_bays] += len(tiers)
         max_large_capacity = max(large_capacity_by_segment.values(), default=1)
@@ -743,6 +865,10 @@ class ScipStage2BayAllocator:
             zone = self._option_zone(bay_numbers, zone_by_bay)
             segment_capacity = max(1, large_capacity_by_segment.get(display_bays, 0))
             segment_scarcity_cost = max(0.0, float(max_large_capacity - segment_capacity))
+            segment_occupied_tiers = large_explicit_occupied_by_segment.get(
+                display_bays,
+                large_fallback_occupied_by_segment.get(display_bays, 0),
+            )
             for tier in self._slot_tiers(slot, area.max_stack_height):
                 atoms = tuple((bay, stack, tier) for bay in bay_numbers)
                 option = Stage2PlacementOption(
@@ -758,6 +884,8 @@ class ScipStage2BayAllocator:
                     rank=rank,
                     segment_capacity=segment_capacity,
                     segment_scarcity_cost=segment_scarcity_cost,
+                    column_occupied_tiers=int(slot.get("column_occupied_tiers") or 0),
+                    segment_occupied_tiers=int(segment_occupied_tiers),
                 )
                 options[ContainerSize.SIZE_40].append(option)
                 if bool(slot.get("is_edge_pair")):
@@ -775,6 +903,8 @@ class ScipStage2BayAllocator:
                             rank=rank,
                             segment_capacity=segment_capacity,
                             segment_scarcity_cost=segment_scarcity_cost,
+                            column_occupied_tiers=int(slot.get("column_occupied_tiers") or 0),
+                            segment_occupied_tiers=int(segment_occupied_tiers),
                         )
                     )
 
@@ -811,6 +941,8 @@ class ScipStage2BayAllocator:
                         "bay_number": bay.bay_number,
                         "stack_index": stack,
                         "tiers": list(range(1, area.max_stack_height + 1)),
+                        "column_occupied_tiers": 0,
+                        "segment_occupied_tiers": int(bay.occupied_columns) * int(area.max_stack_height),
                     }
                 )
         return slots
@@ -842,6 +974,8 @@ class ScipStage2BayAllocator:
                         "stack_index": stack,
                         "tiers": list(range(1, area.max_stack_height + 1)),
                         "is_edge_pair": pair.is_edge_pair,
+                        "column_occupied_tiers": 0,
+                        "segment_occupied_tiers": int(pair.occupied_columns) * int(area.max_stack_height),
                     }
                 )
         return slots
@@ -861,6 +995,31 @@ class ScipStage2BayAllocator:
         if tier < 1 or tier > int(max_stack_height):
             return []
         return [tier]
+
+    @classmethod
+    def _slot_occupied_tiers(cls, slot: Dict[str, Any], max_stack_height: int) -> int:
+        for key in ("column_occupied_tiers", "occupied_tiers", "top_occupied_tier"):
+            if key not in slot:
+                continue
+            try:
+                return max(0, int(slot.get(key) or 0))
+            except (TypeError, ValueError):
+                continue
+        tiers = cls._slot_tiers(slot, max_stack_height)
+        if not tiers:
+            return 0
+        return max(0, min(tiers) - 1)
+
+    @staticmethod
+    def _slot_segment_occupied_tiers(slot: Dict[str, Any]) -> Optional[int]:
+        for key in ("segment_occupied_tiers", "bay_occupied_tiers"):
+            if key not in slot:
+                continue
+            try:
+                return max(0, int(slot.get(key) or 0))
+            except (TypeError, ValueError):
+                continue
+        return None
 
     def _crane_zones(self, area: YardArea) -> Dict[int, str]:
         bay_numbers = sorted(
@@ -1101,6 +1260,16 @@ class ScipStage2BayAllocator:
             return (min(values), max(values))
         value = int(segment)
         return (value, value)
+
+    @staticmethod
+    def _bay_gap_between_specs(left: BaySpec, right: BaySpec) -> int:
+        left_min, left_max = ScipStage2BayAllocator._bay_spec_sort_key(left)
+        right_min, right_max = ScipStage2BayAllocator._bay_spec_sort_key(right)
+        if left_max < right_min:
+            return right_min - left_max
+        if right_max < left_min:
+            return left_min - right_max
+        return 0
 
     @staticmethod
     def _contiguous_ranges(stacks: List[int]) -> List[Tuple[int, int]]:

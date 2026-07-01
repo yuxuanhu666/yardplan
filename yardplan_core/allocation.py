@@ -21,6 +21,12 @@ from yardplan_core.models import (
     YardArea,
     logger,
 )
+from yardplan_core.simultaneous import (
+    add_simultaneous_loading_conflict,
+    clear_simultaneous_loading_markers,
+    group_root_id,
+    simultaneous_loading_conflict_group_ids,
+)
 from yardplan_core.workload import (
     AreaWorkloadProvider,
     AreaWorkloadSnapshot,
@@ -524,6 +530,7 @@ class Stage1LNSConfig:
     repair_top_k: int = 5
     repair_random_tie_break: bool = True
     repair_tie_tolerance: float = 1e-6
+    repair_unassigned_per_iteration: int = 4
     repair_physical_bias_weight: float = 1.0
     repair_congestion_weight: float = 8.0
     repair_split_bias_weight: float = 3.0
@@ -537,6 +544,9 @@ class Stage1LNSConfig:
     guard_min_headroom_ratio: float = 0.5
     guard_large_group_column_threshold: int = 4
     guard_regret_recompute_interval: int = 1
+    simultaneous_loading_pair_count: int = 3
+    simultaneous_loading_safety_gap_bays: int = 4
+    simultaneous_loading_same_area_weight: float = 2500.0
     alns_reaction_factor: float = 0.2
     alns_segment_length: int = 8
     alns_reward_global_best: float = 8.0
@@ -673,6 +683,7 @@ class Stage1YardAreaAssigner:
         self._time_steps: List[TimeStep] = []
         self._voyage_step_span: Dict[str, List[int]] = {}
         self._last_search_summary: Dict[str, object] = {}
+        self._last_convergence_history: List[Dict[str, Any]] = []
 
     def _resolve_workload_provider(self) -> Optional[AreaWorkloadProvider]:
         provider_name = (self.config.workload_provider or "").lower()
@@ -766,6 +777,7 @@ class Stage1YardAreaAssigner:
         original_groups = list(groups)
         area_by_id = {area.area_id: area for area in yard_areas}
         self._area_by_id = dict(area_by_id)
+        self._mark_simultaneous_loading_conflicts(original_groups)
 
         solution = self._construct_initial_solution(original_groups, yard_areas)
         best = self._run_lns(solution, original_groups, yard_areas)
@@ -790,6 +802,50 @@ class Stage1YardAreaAssigner:
             len(unassigned),
         )
         return assignments, unassigned
+
+    def _mark_simultaneous_loading_conflicts(
+        self,
+        groups: List[AllocationGroup],
+    ) -> List[Tuple[str, str, str]]:
+        for group in groups:
+            clear_simultaneous_loading_markers(group)
+
+        pair_count = max(0, int(self.config.simultaneous_loading_pair_count or 0))
+        if pair_count <= 0:
+            return []
+
+        groups_by_voyage_root: Dict[str, Dict[str, List[AllocationGroup]]] = defaultdict(
+            lambda: defaultdict(list)
+        )
+        for group in groups:
+            if group.business_type != BusinessType.EXPORT or not group.voyage_id:
+                continue
+            groups_by_voyage_root[str(group.voyage_id)][group_root_id(group)].append(group)
+
+        selected_pairs: List[Tuple[str, str, str]] = []
+        gap = max(0, int(self.config.simultaneous_loading_safety_gap_bays or 0))
+        for voyage_id, groups_by_root in sorted(groups_by_voyage_root.items()):
+            root_ids = sorted(groups_by_root)
+            if len(root_ids) < 2:
+                continue
+
+            rng = random.Random(
+                f"{self.config.random_seed}:simultaneous-loading:{voyage_id}"
+            )
+            rng.shuffle(root_ids)
+            for index in range(min(pair_count, len(root_ids) // 2)):
+                root_a = root_ids[index * 2]
+                root_b = root_ids[index * 2 + 1]
+                pair_id = f"{voyage_id}-SL{index + 1}"
+                for group in groups_by_root[root_a]:
+                    add_simultaneous_loading_conflict(group, root_b, pair_id, gap)
+                for group in groups_by_root[root_b]:
+                    add_simultaneous_loading_conflict(group, root_a, pair_id, gap)
+                selected_pairs.append((voyage_id, root_a, root_b))
+
+        if selected_pairs:
+            logger.info("Stage1 simultaneous loading pairs: %s", selected_pairs)
+        return selected_pairs
 
     def _build_states(self, yard_areas: List[YardArea]) -> Dict[str, AreaResourceState]:
         return {area.area_id: AreaResourceState.from_area(area) for area in yard_areas}
@@ -843,6 +899,20 @@ class Stage1YardAreaAssigner:
         }
         adaptive_mode = self._use_adaptive_operator_selection()
         iterations_completed = 0
+        history: List[Dict[str, Any]] = [
+            {
+                "iteration": 0,
+                "currentCost": round(current_cost, 6),
+                "candidateCost": round(current_cost, 6),
+                "bestCost": round(best_cost, 6),
+                "accepted": True,
+                "delta": 0.0,
+                "currentUnassigned": len(current.unassigned_group_ids),
+                "candidateUnassigned": len(current.unassigned_group_ids),
+                "bestUnassigned": len(best.unassigned_group_ids),
+                "temperature": round(temperature, 6),
+            }
+        ]
 
         for iteration in range(self.config.max_iterations):
             if self.config.time_limit_seconds is not None:
@@ -870,6 +940,13 @@ class Stage1YardAreaAssigner:
                 candidate.placements_by_group.pop(group_id, None)
                 candidate.unassigned_group_ids.discard(group_id)
 
+            repair_ids = self._repair_ids_with_unassigned(
+                candidate,
+                removed_ids,
+                group_by_id,
+                yard_areas,
+            )
+
             repair_operator = self._select_alns_operator(
                 iteration=iteration,
                 operators=repair_pool,
@@ -877,7 +954,7 @@ class Stage1YardAreaAssigner:
             )
             repaired = self._apply_repair_operator(
                 candidate,
-                removed_ids,
+                repair_ids,
                 group_by_id,
                 yard_areas,
                 operator=repair_operator,
@@ -921,6 +998,20 @@ class Stage1YardAreaAssigner:
                 )
 
             iterations_completed = iteration + 1
+            history.append(
+                {
+                    "iteration": iterations_completed,
+                    "currentCost": round(current_cost, 6),
+                    "candidateCost": round(candidate_cost, 6),
+                    "bestCost": round(best_cost, 6),
+                    "accepted": bool(accept),
+                    "delta": round(delta, 6),
+                    "currentUnassigned": len(current.unassigned_group_ids),
+                    "candidateUnassigned": len(repaired.unassigned_group_ids),
+                    "bestUnassigned": len(best.unassigned_group_ids),
+                    "temperature": round(temperature, 6),
+                }
+            )
             if adaptive_mode:
                 self._maybe_refresh_alns_weights(
                     iteration=iterations_completed,
@@ -955,7 +1046,46 @@ class Stage1YardAreaAssigner:
                 best_cost,
                 len(best.unassigned_group_ids),
             )
+        self._last_convergence_history = history
         return best
+
+    def _repair_ids_with_unassigned(
+        self,
+        partial: Stage1Solution,
+        removed_ids: List[str],
+        group_by_id: Dict[str, AllocationGroup],
+        yard_areas: List[YardArea],
+    ) -> List[str]:
+        limit = max(0, int(self.config.repair_unassigned_per_iteration or 0))
+        unassigned_ids = [
+            group_id
+            for group_id in partial.unassigned_group_ids
+            if group_id in group_by_id
+        ]
+        unassigned_ids.sort(
+            key=lambda group_id: self._unassigned_repair_priority(
+                group_by_id[group_id],
+                yard_areas,
+            )
+        )
+        if limit > 0:
+            unassigned_ids = unassigned_ids[:limit]
+
+        ordered: List[str] = []
+        seen: Set[str] = set()
+        for group_id in unassigned_ids + list(removed_ids):
+            if group_id in seen or group_id not in group_by_id:
+                continue
+            ordered.append(group_id)
+            seen.add(group_id)
+        return ordered
+
+    def _unassigned_repair_priority(
+        self,
+        group: AllocationGroup,
+        yard_areas: List[YardArea],
+    ) -> Tuple[int, int, int, int]:
+        return self._difficulty_key(group, yard_areas)
 
     def _use_adaptive_operator_selection(self) -> bool:
         return (
@@ -1094,7 +1224,50 @@ class Stage1YardAreaAssigner:
         cost += context.physical_cost * self.config.physical_weight
         cost += context.berth_distance_cost * self.config.berth_distance_weight
         cost += context.busy_profile_cost * self.config.busy_profile_weight
+        cost += self._simultaneous_loading_same_area_cost(solution, group_by_id)
         return cost
+
+    def _simultaneous_loading_same_area_cost(
+        self,
+        solution: Stage1Solution,
+        group_by_id: Dict[str, AllocationGroup],
+    ) -> float:
+        weight = float(self.config.simultaneous_loading_same_area_weight or 0.0)
+        if weight <= 0.0:
+            return 0.0
+
+        areas_by_root: Dict[str, Set[str]] = defaultdict(set)
+        roots_by_voyage: Dict[str, Set[str]] = defaultdict(set)
+        root_groups: Dict[str, AllocationGroup] = {}
+        for group_id, placements in solution.placements_by_group.items():
+            group = group_by_id.get(group_id)
+            if group is None:
+                continue
+            root_id = group_root_id(group)
+            root_groups.setdefault(root_id, group)
+            if group.voyage_id:
+                roots_by_voyage[str(group.voyage_id)].add(root_id)
+            for placement in placements:
+                if placement.area_id:
+                    areas_by_root[root_id].add(placement.area_id)
+
+        pair_keys: Set[Tuple[str, str, str]] = set()
+        for voyage_id, root_ids in roots_by_voyage.items():
+            for root_id in root_ids:
+                group = root_groups.get(root_id)
+                if group is None:
+                    continue
+                for other_id in simultaneous_loading_conflict_group_ids(group):
+                    if other_id not in root_ids:
+                        continue
+                    left, right = sorted((root_id, other_id))
+                    pair_keys.add((voyage_id, left, right))
+
+        conflict_count = 0
+        for _voyage_id, root_a, root_b in pair_keys:
+            shared_areas = areas_by_root.get(root_a, set()) & areas_by_root.get(root_b, set())
+            conflict_count += len(shared_areas)
+        return weight * conflict_count
 
     def evaluate_placement_delta(
         self,
@@ -1186,8 +1359,18 @@ class Stage1YardAreaAssigner:
         group_by_id: Dict[str, AllocationGroup],
         yard_areas: List[YardArea],
     ) -> Stage1Solution:
-        ordered = [group_by_id[group_id] for group_id in group_ids if group_id in group_by_id]
+        ordered = [
+            group_by_id[group_id]
+            for group_id in group_ids
+            if group_id in group_by_id
+        ]
         self._rng.shuffle(ordered)
+        ordered.sort(
+            key=lambda group: (
+                0 if group.group_id in partial.unassigned_group_ids else 1,
+                self._unassigned_repair_priority(group, yard_areas),
+            )
+        )
         for group in ordered:
             candidate = self._try_assign_group(partial, group, group_by_id, yard_areas)
             if candidate is None:
@@ -2778,6 +2961,7 @@ class Stage1YardAreaAssigner:
                 parent_group_id=group.group_id,
                 split_index=idx,
             )
+            sub_group.group_attributes.update(group.group_attributes)
             split_groups.append(sub_group)
 
         return split_groups
@@ -2801,6 +2985,7 @@ class Stage2BayAllocator:
 
     def __init__(self, scip_config=None):
         self.scip_config = scip_config
+        self.last_placement_progress: List[Dict[str, Any]] = []
 
     def allocate(
         self,
@@ -2818,11 +3003,13 @@ class Stage2BayAllocator:
             area_assignments,
             groups,
         )
-        allocations = ScipStage2BayAllocator(self.scip_config).allocate(
+        allocator = ScipStage2BayAllocator(self.scip_config)
+        allocations = allocator.allocate(
             merged_assignments,
             groups,
             yard_areas,
         )
+        self.last_placement_progress = list(getattr(allocator, "placement_progress", []))
         log_stage2_merged_parent_contiguity(allocations, merged_keys)
         return allocations, merged_assignments
 
@@ -2837,6 +3024,8 @@ class AllocationEngine:
     ):
         self.stage1 = stage1 or Stage1YardAreaAssigner()
         self.stage2 = stage2 or Stage2BayAllocator()
+        self.last_stage1_convergence: List[Dict[str, Any]] = []
+        self.last_stage2_progress: List[Dict[str, Any]] = []
 
     def allocate(
         self,
@@ -2851,6 +3040,12 @@ class AllocationEngine:
             area_assignments,
             group_dict,
             {area.area_id: area for area in yard_areas},
+        )
+        self.last_stage1_convergence = list(
+            getattr(self.stage1, "_last_convergence_history", [])
+        )
+        self.last_stage2_progress = list(
+            getattr(self.stage2, "last_placement_progress", [])
         )
         return area_assignments, bay_allocations, unassigned
 

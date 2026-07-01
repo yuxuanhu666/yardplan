@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import math
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, DefaultDict, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from yardplan_core.simultaneous import (
+    simultaneous_loading_conflict_group_ids,
+    simultaneous_loading_safety_gap_bays,
+)
 
 
 @dataclass(frozen=True)
@@ -57,13 +63,18 @@ def score_yard_plan(
             vessel_map=vessel_map,
         ),
         "demand_satisfaction": _score_demand_satisfaction(root_demands, facts),
-        "business_dispersion": _score_business_dispersion(root_demands, facts),
+        "business_dispersion": _score_business_dispersion(
+            root_demands,
+            facts,
+            groups=groups,
+            vessel_map=vessel_map,
+        ),
         "area_peak_staggering": _score_area_peak_staggering(
             facts,
             yard_areas=yard_areas,
             workload_snapshot=workload_snapshot,
         ),
-        "bay_utilization_purity": _score_bay_utilization_purity(
+        "bay_quality": _score_bay_quality(
             allocations,
             group_by_id=group_by_id,
             yard_areas=yard_areas,
@@ -90,7 +101,7 @@ def format_score_report(score: Dict[str, Any], *, indent: str = "") -> str:
         "demand_satisfaction": "Demand satisfaction",
         "business_dispersion": "Business dispersion / concentration",
         "area_peak_staggering": "Area peak staggering",
-        "bay_utilization_purity": "Bay utilization / purity",
+        "bay_quality": "Bay quality / purity / rehandle risk",
     }
     lines = [
         f"{indent}Total score: {_fmt(score.get('totalScore'))}/{_fmt(score.get('maxScore', 50.0))}"
@@ -112,60 +123,82 @@ def _score_area_peak_staggering(
     yard_areas: Sequence[Any],
     workload_snapshot: Optional[Any],
 ) -> Dict[str, Any]:
-    series = _build_workload_series(facts, yard_areas, workload_snapshot)
+    series = _build_voyage_workload_series(facts, workload_snapshot)
     if not series:
-        return _item(0.0, "No workload data")
+        return _item(10.0, "No cross-vessel workload to compare")
 
-    by_area: DefaultDict[str, List[Dict[str, float]]] = defaultdict(list)
-    for (area_id, _step_id), values in series.items():
-        by_area[area_id].append(values)
+    area_voyages: DefaultDict[str, set[str]] = defaultdict(set)
+    for area_id, voyage_id in series:
+        area_voyages[area_id].add(voyage_id)
 
-    weighted = 0.0
-    total_weight = 0.0
+    weighted_score = 0.0
+    total_possible = 0.0
     area_details: Dict[str, Any] = {}
-    for area_id, rows in sorted(by_area.items()):
-        inbound_total = sum(row["inbound"] for row in rows)
-        outbound_total = sum(row["outbound"] for row in rows)
-        weight = inbound_total + outbound_total
-        if weight <= 0.0:
-            continue
 
-        if inbound_total <= 0.0 or outbound_total <= 0.0:
-            overlap = 0.0
-            peak_gap = 0.0
-            score = 10.0
+    for area_id, voyages in sorted(area_voyages.items()):
+        ordered_voyages = sorted(voyages)
+        area_overlap = 0.0
+        area_possible = 0.0
+        pair_details: List[Dict[str, Any]] = []
+
+        for left_index, left_voyage in enumerate(ordered_voyages):
+            for right_voyage in ordered_voyages[left_index + 1 :]:
+                left_series = series[(area_id, left_voyage)]
+                right_series = series[(area_id, right_voyage)]
+                pair_overlap, pair_possible, pair_steps = _opposite_direction_overlap(
+                    left_series,
+                    right_series,
+                )
+                if pair_possible <= 1e-9:
+                    continue
+
+                pair_ratio = _safe_div(pair_overlap, pair_possible)
+                pair_score = 10.0 * (1.0 - _clamp(pair_ratio, 0.0, 1.0))
+                area_overlap += pair_overlap
+                area_possible += pair_possible
+                pair_details.append(
+                    {
+                        "voyages": [left_voyage, right_voyage],
+                        "oppositeOverlapMoves": round(pair_overlap, 3),
+                        "oppositePossibleMoves": round(pair_possible, 3),
+                        "conflictRatio": round(pair_ratio, 4),
+                        "score": round(pair_score, 2),
+                        "steps": pair_steps,
+                    }
+                )
+
+        if area_possible <= 1e-9:
+            area_score = 10.0
+            conflict_ratio = 0.0
         else:
-            inbound_share = [row["inbound"] / inbound_total for row in rows]
-            outbound_share = [row["outbound"] / outbound_total for row in rows]
-            overlap = sum(min(i, o) for i, o in zip(inbound_share, outbound_share))
-            inbound_peak = max(range(len(rows)), key=lambda idx: rows[idx]["inbound"])
-            outbound_peak = max(range(len(rows)), key=lambda idx: rows[idx]["outbound"])
-            peak_gap = abs(inbound_peak - outbound_peak)
-            gap_bonus = min(1.0, peak_gap / 2.0)
-            score = 10.0 * (
-                0.7 * (1.0 - _clamp(overlap, 0.0, 1.0))
-                + 0.3 * gap_bonus
-            )
+            conflict_ratio = _safe_div(area_overlap, area_possible)
+            area_score = 10.0 * (1.0 - _clamp(conflict_ratio, 0.0, 1.0))
+            weighted_score += area_possible * area_score
+            total_possible += area_possible
 
-        weighted += weight * score
-        total_weight += weight
         area_details[area_id] = {
-            "overlap": round(overlap, 4),
-            "peakGap": int(peak_gap),
-            "moves": round(weight, 3),
-            "score": round(score, 2),
+            "voyageCount": len(ordered_voyages),
+            "oppositeOverlapMoves": round(area_overlap, 3),
+            "oppositePossibleMoves": round(area_possible, 3),
+            "conflictRatio": round(conflict_ratio, 4),
+            "score": round(area_score, 2),
+            "pairs": pair_details,
         }
 
-    if total_weight <= 0.0:
-        return _item(0.0, "No active area workload")
+    if total_possible <= 1e-9:
+        return _item(
+            10.0,
+            "No different-voyage opposite-direction overlap",
+            areas=area_details,
+        )
     return _item(
-        weighted / total_weight,
-        "0.7*(1-overlap) + 0.3*min(peak_gap/2, 1)",
+        weighted_score / total_possible,
+        "1 - different-voyage opposite-direction overlap ratio",
         areas=area_details,
     )
 
 
-def _score_bay_utilization_purity(
+def _score_bay_quality(
     allocations: Sequence[Any],
     *,
     group_by_id: Dict[str, Any],
@@ -178,6 +211,9 @@ def _score_bay_utilization_purity(
     )
     bay_group_sizes: DefaultDict[Tuple[str, int], Dict[str, Any]] = defaultdict(dict)
     group_total_by_bay_capacity: DefaultDict[Tuple[str, float], float] = defaultdict(float)
+    column_weight_counts: DefaultDict[Tuple[str, Any, int], DefaultDict[str, int]] = defaultdict(
+        lambda: defaultdict(int)
+    )
 
     for allocation in allocations:
         group_id = str(getattr(allocation, "group_id", ""))
@@ -186,6 +222,7 @@ def _score_bay_utilization_purity(
             continue
         group = group_by_id.get(group_id)
         size = _enum_value(getattr(group, "size", getattr(allocation, "size", None)))
+        weight_name = _weight_class_name(getattr(group, "weight_class", None))
         for bay_number, columns in _allocation_columns_by_bay(allocation).items():
             load = max(0.0, columns)
             if load <= 0.0:
@@ -198,6 +235,11 @@ def _score_bay_utilization_purity(
             group_total_by_bay_capacity[group_key] += load
             if bay_key not in bay_capacity:
                 bay_capacity[bay_key] = max(1.0, load)
+        for bay_spec, stack_index, tiers in _allocation_exact_columns(allocation):
+            if not tiers:
+                continue
+            column_key = (area_id, _normalise_bay_spec(bay_spec), int(stack_index))
+            column_weight_counts[column_key][weight_name] += len(tiers)
 
     total_planned = sum(
         sum(group_loads.values()) for group_loads in bay_group_loads.values()
@@ -239,18 +281,26 @@ def _score_bay_utilization_purity(
         1.0,
     )
     purity_score = _safe_div(purity_weighted, total_planned)
-    score = 10.0 * (0.6 * utilization_score + 0.4 * purity_score)
+    rehandle_score, column_details = _rehandle_risk_score(column_weight_counts)
+    score = 10.0 * (
+        0.45 * utilization_score
+        + 0.25 * purity_score
+        + 0.30 * rehandle_score
+    )
 
     return _item(
         score,
-        "0.6*bay_utilization_score + 0.4*bay_purity_score",
+        "0.45*bay_utilization_score + 0.25*bay_purity_score + 0.30*rehandle_risk_score",
         fullThreshold=full_threshold,
         fullRatio=round(full_ratio, 4),
         activatedUtilization=round(activated_util, 4),
         utilizationScore=round(utilization_score, 4),
         purityScore=round(purity_score, 4),
+        rehandleRiskScore=round(rehandle_score, 4),
+        rehandleRiskRaw=round(10.0 * rehandle_score, 2),
         plannedColumns=round(total_planned, 3),
         bays=bay_details,
+        columns=column_details,
     )
 
 
@@ -379,29 +429,69 @@ def _score_transport_distance(
 def _score_business_dispersion(
     root_demands: Dict[str, float],
     facts: Sequence[AllocationFact],
+    *,
+    groups: Sequence[Any],
+    vessel_map: Dict[str, Any],
 ) -> Dict[str, Any]:
     if not root_demands:
         return _item(0.0, "No demand groups")
 
-    by_root_area: DefaultDict[str, DefaultDict[str, float]] = defaultdict(
+    root_groups: Dict[str, Any] = {}
+    for group in groups:
+        group_id = str(getattr(group, "group_id", "") or "")
+        if not group_id:
+            continue
+        root_id = _root_group_id(group, group_id)
+        if getattr(group, "parent_group_id", None):
+            root_groups.setdefault(root_id, group)
+        else:
+            root_groups[root_id] = group
+
+    voyage_area_loads: DefaultDict[str, DefaultDict[str, float]] = defaultdict(
         lambda: defaultdict(float)
     )
-    root_groups: Dict[str, Any] = {}
+    root_area_bays: DefaultDict[str, DefaultDict[str, set[int]]] = defaultdict(
+        lambda: defaultdict(set)
+    )
+    voyage_demands: DefaultDict[str, float] = defaultdict(float)
+    voyage_groups: Dict[str, Any] = {}
     for fact in facts:
-        by_root_area[fact.root_group_id][fact.yard_area_id] += max(0.0, fact.planned_containers)
-        if fact.root_group_id not in root_groups and fact.group is not None:
-            root_groups[fact.root_group_id] = fact.group
+        group = fact.group
+        voyage_id = str(getattr(group, "voyage_id", "") or "")
+        if not voyage_id:
+            continue
+        voyage_area_loads[voyage_id][fact.yard_area_id] += max(0.0, fact.planned_containers)
+        root_area_bays[fact.root_group_id][fact.yard_area_id].update(
+            _allocation_bays(fact.allocation)
+        )
+        if voyage_id not in voyage_groups and group is not None:
+            voyage_groups[voyage_id] = group
+        if fact.root_group_id not in root_groups and group is not None:
+            root_groups[fact.root_group_id] = group
 
-    total_demand = sum(root_demands.values())
-    weighted = 0.0
-    details: Dict[str, Any] = {}
+    voyage_root_ids: DefaultDict[str, set[str]] = defaultdict(set)
     for root_id, demand in root_demands.items():
         group = root_groups.get(root_id)
         voyage_id = str(getattr(group, "voyage_id", "") or "")
-        area_loads = by_root_area.get(root_id, {})
+        if not voyage_id:
+            continue
+        voyage_demands[voyage_id] += max(0.0, demand)
+        voyage_groups.setdefault(voyage_id, group)
+        voyage_root_ids[voyage_id].add(root_id)
+
+    total_demand = sum(voyage_demands.values())
+    if total_demand <= 0.0:
+        return _item(0.0, "No voyage demand groups")
+
+    weighted = 0.0
+    details: Dict[str, Any] = {}
+    for voyage_id, demand in sorted(voyage_demands.items()):
+        group = voyage_groups.get(voyage_id)
+        vessel = vessel_map.get(voyage_id)
+        area_loads = voyage_area_loads.get(voyage_id, {})
         assigned = sum(area_loads.values())
         if assigned <= 0.0:
-            details[root_id] = {
+            details[voyage_id] = {
                 "score": 0.0,
                 "reason": "unassigned",
                 "voyageId": voyage_id,
@@ -409,33 +499,58 @@ def _score_business_dispersion(
             continue
 
         assigned_areas = len([v for v in area_loads.values() if v > 0.0])
-        eqp_num = _group_eqp_num(group)
+        eqp_num = _vessel_eqp_num(vessel)
         if eqp_num <= 0:
-            group_score = 0.0
+            eqp_num = _group_eqp_num(group)
+
+        area_match_raw = 0.0
+        if eqp_num <= 0:
             status = "missing crane count"
             target_areas = None
         else:
-            target_areas = 2 * eqp_num
-            if assigned_areas < target_areas - 1 or assigned_areas > target_areas + 2:
-                group_score = 0.0
-            else:
-                group_score = max(0.0, 10.0 - 2.0 * abs(assigned_areas - target_areas))
-            status = "target=2*crane_count, accept [-1,+2]"
+            target_areas = eqp_num
+            area_match_raw = _voyage_area_match_score(
+                assigned_areas=assigned_areas,
+                target_areas=target_areas,
+            )
+            status = "target=crane_count, accept [-1,+2]"
 
-        weighted += (demand / total_demand) * group_score
-        details[root_id] = {
-            "score": round(group_score, 2),
+        sim_safety_raw, pair_details = _voyage_simultaneous_loading_safety_score(
+            voyage_id=voyage_id,
+            root_ids=voyage_root_ids.get(voyage_id, set()),
+            root_groups=root_groups,
+            root_area_bays=root_area_bays,
+        )
+        vessel_score = 0.6 * area_match_raw + 0.4 * sim_safety_raw
+        violating_pair_count = sum(
+            1 for pair in pair_details if pair.get("score", 10.0) < 10.0
+        )
+        gap_values = [
+            int(pair["minGap"])
+            for pair in pair_details
+            if pair.get("minGap") is not None
+        ]
+
+        weighted += (demand / total_demand) * vessel_score
+        details[voyage_id] = {
+            "score": round(vessel_score, 2),
             "voyageId": voyage_id,
             "cranes": eqp_num,
             "targetAreas": target_areas,
             "assignedAreas": assigned_areas,
+            "groupDemand": round(demand, 3),
+            "areaMatchRaw": round(area_match_raw, 2),
+            "simSafetyRaw": round(sim_safety_raw, 2),
+            "violatingPairCount": violating_pair_count,
+            "worstGap": min(gap_values) if gap_values else None,
+            "pairs": pair_details,
             "status": status,
         }
 
     return _item(
         10.0 * weighted,
-        "10 - 2*abs(assigned_area_count - 2*crane_count), zero outside [-1,+2]",
-        groups=details,
+        "0.6*area_match_raw + 0.4*sim_safety_raw",
+        voyages=details,
     )
 
 
@@ -475,6 +590,86 @@ def _group_eqp_num(group: Any) -> int:
     except (TypeError, ValueError):
         return 0
     return max(0, count)
+
+
+def _vessel_eqp_num(vessel: Any) -> int:
+    if vessel is None:
+        return 0
+    try:
+        count = int(getattr(vessel, "eqp_num", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, count)
+
+
+def _voyage_area_match_score(*, assigned_areas: int, target_areas: int) -> float:
+    if target_areas <= 0:
+        return 0.0
+    if assigned_areas < target_areas - 1 or assigned_areas > target_areas + 2:
+        return 0.0
+    return max(0.0, 10.0 - 2.0 * abs(assigned_areas - target_areas))
+
+
+def _voyage_simultaneous_loading_safety_score(
+    *,
+    voyage_id: str,
+    root_ids: set[str],
+    root_groups: Dict[str, Any],
+    root_area_bays: DefaultDict[str, DefaultDict[str, set[int]]],
+) -> Tuple[float, List[Dict[str, Any]]]:
+    del voyage_id
+    pair_keys: set[Tuple[str, str]] = set()
+    pair_details: List[Dict[str, Any]] = []
+
+    for root_id in sorted(root_ids):
+        group = root_groups.get(root_id)
+        if group is None:
+            continue
+        for other_root_id in simultaneous_loading_conflict_group_ids(group):
+            if other_root_id not in root_ids or other_root_id == root_id:
+                continue
+            pair_key = tuple(sorted((root_id, other_root_id)))
+            if pair_key in pair_keys:
+                continue
+            pair_keys.add(pair_key)
+
+            left_group = root_groups.get(pair_key[0])
+            right_group = root_groups.get(pair_key[1])
+            default_gap = 4
+            required_gap = max(
+                int(simultaneous_loading_safety_gap_bays(left_group, default_gap) or 0),
+                int(simultaneous_loading_safety_gap_bays(right_group, default_gap) or 0),
+                default_gap,
+            )
+            shared_areas = sorted(
+                set(root_area_bays.get(pair_key[0], {}))
+                & set(root_area_bays.get(pair_key[1], {}))
+            )
+            min_gap: Optional[int] = None
+            if shared_areas:
+                for area_id in shared_areas:
+                    left_bays = root_area_bays.get(pair_key[0], {}).get(area_id, set())
+                    right_bays = root_area_bays.get(pair_key[1], {}).get(area_id, set())
+                    area_gap = _min_bay_gap(left_bays, right_bays)
+                    if min_gap is None or area_gap < min_gap:
+                        min_gap = area_gap
+
+            pair_score = _simultaneous_gap_score(min_gap, required_gap)
+            pair_details.append(
+                {
+                    "pair": [pair_key[0], pair_key[1]],
+                    "requiredGap": required_gap,
+                    "sharedAreas": shared_areas,
+                    "minGap": min_gap,
+                    "score": round(pair_score, 2),
+                }
+            )
+
+    if not pair_details:
+        return 10.0, []
+
+    average_score = sum(float(pair["score"]) for pair in pair_details) / len(pair_details)
+    return average_score, pair_details
 
 
 def _area_distance_to_berth(
@@ -649,6 +844,82 @@ def _build_workload_series(
     return series
 
 
+def _build_voyage_workload_series(
+    facts: Sequence[AllocationFact],
+    workload_snapshot: Optional[Any],
+) -> Dict[Tuple[str, str], Dict[int, Dict[str, float]]]:
+    series: DefaultDict[Tuple[str, str], DefaultDict[int, Dict[str, float]]] = defaultdict(
+        lambda: defaultdict(lambda: {"inbound": 0.0, "outbound": 0.0})
+    )
+    for fact in facts:
+        group = fact.group
+        voyage_id = str(getattr(group, "voyage_id", "") or "")
+        if not voyage_id:
+            continue
+
+        fact_steps = _step_ids_for_group(group, workload_snapshot)
+        if not fact_steps and workload_snapshot is not None:
+            step_id = getattr(workload_snapshot, "step_for_voyage", lambda _voyage: None)(
+                voyage_id
+            )
+            if step_id is not None:
+                fact_steps = [int(step_id)]
+        if not fact_steps:
+            fact_steps = [0]
+
+        per_step = fact.planned_containers / max(1, len(fact_steps))
+        inbound_delta, outbound_delta = _move_delta(fact.business_type, per_step)
+        for step_id in fact_steps:
+            row = series[(fact.yard_area_id, voyage_id)][int(step_id)]
+            row["inbound"] += inbound_delta
+            row["outbound"] += outbound_delta
+
+    return {
+        key: {step_id: dict(values) for step_id, values in rows.items()}
+        for key, rows in series.items()
+    }
+
+
+def _opposite_direction_overlap(
+    left_series: Dict[int, Dict[str, float]],
+    right_series: Dict[int, Dict[str, float]],
+) -> Tuple[float, float, List[Dict[str, Any]]]:
+    overlap = 0.0
+    possible = 0.0
+    step_details: List[Dict[str, Any]] = []
+    for step_id in sorted(set(left_series).intersection(right_series)):
+        left = left_series.get(step_id, {})
+        right = right_series.get(step_id, {})
+        left_inbound = max(0.0, _as_float(left.get("inbound")))
+        left_outbound = max(0.0, _as_float(left.get("outbound")))
+        right_inbound = max(0.0, _as_float(right.get("inbound")))
+        right_outbound = max(0.0, _as_float(right.get("outbound")))
+
+        step_overlap = min(left_inbound, right_outbound) + min(left_outbound, right_inbound)
+        step_possible = min(
+            left_inbound + left_outbound,
+            right_inbound + right_outbound,
+        )
+        if step_possible <= 1e-9:
+            continue
+
+        overlap += step_overlap
+        possible += step_possible
+        step_details.append(
+            {
+                "stepId": int(step_id),
+                "leftInbound": round(left_inbound, 3),
+                "leftOutbound": round(left_outbound, 3),
+                "rightInbound": round(right_inbound, 3),
+                "rightOutbound": round(right_outbound, 3),
+                "oppositeOverlapMoves": round(step_overlap, 3),
+                "oppositePossibleMoves": round(step_possible, 3),
+            }
+        )
+
+    return overlap, possible, step_details
+
+
 def _step_ids_for_group(group: Any, workload_snapshot: Optional[Any]) -> List[int]:
     if group is None or workload_snapshot is None:
         return []
@@ -705,10 +976,176 @@ def _allocation_columns_by_bay(allocation: Any) -> Dict[int, float]:
     return dict(by_bay)
 
 
+def _allocation_bays(allocation: Any) -> List[int]:
+    bays: set[int] = set()
+    for bay_spec, _columns in getattr(allocation, "bay_column_details", []) or []:
+        bays.update(_bay_numbers(bay_spec))
+    for bay_spec, _start_stack, _end_stack in getattr(allocation, "bay_stack_details", []) or []:
+        bays.update(_bay_numbers(bay_spec))
+    return sorted(bays)
+
+
 def _bay_numbers(bay_spec: Any) -> List[int]:
     if isinstance(bay_spec, (list, tuple)):
         return [int(value) for value in bay_spec]
     return [int(bay_spec)]
+
+
+def _min_bay_gap(left_bays: Iterable[int], right_bays: Iterable[int]) -> int:
+    left_values = sorted({int(value) for value in left_bays})
+    right_values = sorted({int(value) for value in right_bays})
+    if not left_values or not right_values:
+        return 0
+
+    min_gap: Optional[int] = None
+    for left in left_values:
+        for right in right_values:
+            gap = abs(int(right) - int(left))
+            if min_gap is None or gap < min_gap:
+                min_gap = gap
+    return int(min_gap or 0)
+
+
+def _simultaneous_gap_score(min_gap: Optional[int], required_gap: int) -> float:
+    if min_gap is None or min_gap >= required_gap:
+        return 10.0
+    if min_gap == 3:
+        return 7.0
+    if min_gap == 2:
+        return 4.0
+    if min_gap == 1:
+        return 1.0
+    return 0.0
+
+
+def _allocation_exact_columns(
+    allocation: Any,
+) -> List[Tuple[Any, int, List[int]]]:
+    exact = _extract_exact_note(getattr(allocation, "notes", "") or "")
+    if not exact:
+        return []
+
+    entries: List[Tuple[Any, int, List[int]]] = []
+    for entry in exact.split("; "):
+        parsed = _parse_exact_entry(entry)
+        if parsed is None:
+            continue
+        bay_spec, stack_index, tier_ranges = parsed
+        tiers: List[int] = []
+        for start, end in tier_ranges:
+            tiers.extend(range(int(start), int(end) + 1))
+        if tiers:
+            entries.append((bay_spec, int(stack_index), sorted(set(tiers))))
+    return entries
+
+
+def _extract_exact_note(notes: str) -> str:
+    marker = "exact "
+    if not notes or marker not in notes:
+        return ""
+    return notes.split(marker, 1)[1].strip()
+
+
+def _parse_exact_entry(
+    entry: str,
+) -> Optional[Tuple[Any, int, List[Tuple[int, int]]]]:
+    prefix, sep, tiers_text = entry.partition(" tiers ")
+    if not sep:
+        return None
+    bay_text, sep, stack_text = prefix.partition(": stack ")
+    if not sep:
+        return None
+    try:
+        bay_spec = ast.literal_eval(bay_text.strip())
+    except (SyntaxError, ValueError):
+        try:
+            bay_spec = int(bay_text.strip())
+        except ValueError:
+            return None
+    try:
+        stack_index = int(stack_text.strip())
+    except ValueError:
+        return None
+    tier_ranges = _parse_tier_ranges(tiers_text.strip())
+    if not tier_ranges:
+        return None
+    return bay_spec, stack_index, tier_ranges
+
+
+def _parse_tier_ranges(text: str) -> List[Tuple[int, int]]:
+    ranges: List[Tuple[int, int]] = []
+    for part in text.split(","):
+        piece = part.strip()
+        if not piece:
+            continue
+        if "-" in piece:
+            left, right = piece.split("-", 1)
+            try:
+                start, end = int(left), int(right)
+            except ValueError:
+                continue
+        else:
+            try:
+                start = end = int(piece)
+            except ValueError:
+                continue
+        ranges.append((min(start, end), max(start, end)))
+    return ranges
+
+
+def _normalise_bay_spec(bay_spec: Any) -> Any:
+    if isinstance(bay_spec, (list, tuple)):
+        return tuple(int(value) for value in bay_spec)
+    return int(bay_spec)
+
+
+def _weight_class_name(weight_class: Any) -> str:
+    raw = getattr(weight_class, "value", weight_class)
+    return str(raw or "light").lower()
+
+
+def _rehandle_risk_score(
+    column_weight_counts: DefaultDict[Tuple[str, Any, int], DefaultDict[str, int]],
+) -> Tuple[float, Dict[str, Any]]:
+    total_weight = 0.0
+    weighted_score = 0.0
+    column_details: Dict[str, Any] = {}
+
+    for column_key, counts in sorted(
+        column_weight_counts.items(),
+        key=lambda item: (str(item[0][0]), str(item[0][1]), int(item[0][2])),
+    ):
+        empty_count = int(counts.get("empty", 0))
+        light_count = int(counts.get("light", 0))
+        heavy_count = int(counts.get("heavy", 0))
+        total = empty_count + light_count + heavy_count
+        if total <= 0:
+            continue
+
+        numerator = (
+            math.factorial(empty_count)
+            * math.factorial(light_count)
+            * math.factorial(heavy_count)
+        )
+        denominator = math.factorial(total)
+        no_rehandle_probability = _safe_div(float(numerator), float(denominator))
+        column_score = 10.0 * no_rehandle_probability
+
+        total_weight += total
+        weighted_score += total * no_rehandle_probability
+        area_id, bay_spec, stack_index = column_key
+        column_details[f"{area_id}:{bay_spec}:{stack_index}"] = {
+            "emptyCount": empty_count,
+            "lightCount": light_count,
+            "heavyCount": heavy_count,
+            "containerCount": total,
+            "noRehandleProbability": round(no_rehandle_probability, 6),
+            "score": round(column_score, 2),
+        }
+
+    if total_weight <= 0.0:
+        return 1.0, {}
+    return weighted_score / total_weight, column_details
 
 
 def _group_container_demand(group: Any) -> float:

@@ -11,6 +11,17 @@ from yardplan_core.models import (
     WeightClass,
     YardArea,
 )
+from yardplan_core.allocation import (
+    Stage1LNSConfig,
+    Stage1Placement,
+    Stage1Solution,
+    Stage1YardAreaAssigner,
+)
+from yardplan_core.simultaneous import (
+    SIMULTANEOUS_LOADING_SAFETY_GAP_BAYS,
+    add_simultaneous_loading_conflict,
+    simultaneous_loading_conflict_group_ids,
+)
 from yardplan_core.stage2_scip import (
     ScipStage2BayAllocator,
     _bays_from_bay_spec,
@@ -44,10 +55,11 @@ def make_group(
     weight_class: WeightClass = WeightClass.LIGHT,
     voyage_id: str = "V001",
     line_key: int = 1,
+    business_type: BusinessType = BusinessType.IMPORT,
 ) -> AllocationGroup:
     return AllocationGroup(
         group_id=group_id,
-        business_type=BusinessType.IMPORT,
+        business_type=business_type,
         size=size,
         container_type=ContainerType.DRY,
         weight_class=weight_class,
@@ -282,6 +294,60 @@ class Stage2GreedyTests(unittest.TestCase):
         self.assertEqual(len(atoms), len(set(atoms)))
         assert_hard_constraints(self, allocator, {group.group_id: group for group in groups})
 
+    def test_simultaneous_loading_conflict_keeps_four_bay_gap(self):
+        area = make_area(bay_count=5, columns=1, height=1)
+        first = make_group("GA", ContainerSize.SIZE_20, 1)
+        second = make_group("GB", ContainerSize.SIZE_20, 1)
+        add_simultaneous_loading_conflict(first, "GB", "PAIR-1", 4)
+        add_simultaneous_loading_conflict(second, "GA", "PAIR-1", 4)
+        allocator = CapturingAllocator()
+
+        allocator.allocate(
+            [make_assignment(group.group_id, group.container_count) for group in (first, second)],
+            {first.group_id: first, second.group_id: second},
+            {area.area_id: area},
+        )
+
+        first_bay = allocator.selected_by_group["GA"][0].bay_spec
+        second_bay = allocator.selected_by_group["GB"][0].bay_spec
+        self.assertEqual((first_bay, second_bay), (1, 5))
+        self.assertGreaterEqual(abs(int(second_bay) - int(first_bay)), 4)
+        assert_hard_constraints(self, allocator, {group.group_id: group for group in (first, second)})
+
+    def test_greedy_prefers_empty_bay_then_uses_busy_bay_when_needed(self):
+        area = make_area(bay_count=2, columns=2, height=3)
+        area._stage2_single_slots = [
+            {
+                "bay_number": 1,
+                "stack_index": 1,
+                "tiers": [3],
+                "column_occupied_tiers": 2,
+                "segment_occupied_tiers": 4,
+            },
+            {
+                "bay_number": 2,
+                "stack_index": 1,
+                "tiers": [1],
+                "column_occupied_tiers": 0,
+                "segment_occupied_tiers": 0,
+            },
+        ]
+        group = make_group("G20", ContainerSize.SIZE_20, 2)
+        allocator = CapturingAllocator()
+
+        allocator.allocate(
+            [make_assignment(group.group_id, group.container_count)],
+            {group.group_id: group},
+            {area.area_id: area},
+        )
+
+        selected = allocator.selected_by_group["G20"]
+        self.assertEqual(
+            [(option.bay_spec, option.stack_index, option.tier_index) for option in selected],
+            [(2, 1, 1), (1, 1, 3)],
+        )
+        assert_hard_constraints(self, allocator, {group.group_id: group})
+
     def test_visualization_conflict_uses_exact_tiers_when_available(self):
         area = make_area(bay_count=1, columns=1, height=3)
         area._stage2_single_slots = [
@@ -371,6 +437,75 @@ class Stage2GreedyTests(unittest.TestCase):
         self.assertEqual(regions[("A", 1, 1, "G20")], (0.0, 0.0, 2.0, 1.0))
         self.assertEqual(regions[("A", 1, 1, "H20")], (2.0, 0.0, 3.0, 1.0))
         self.assertEqual(regions[("A", 2, 2, "G20")], (0.0, 1.0, 1.0, 2.0))
+
+    def test_stage1_marks_three_reproducible_simultaneous_loading_pairs(self):
+        groups = [
+            make_group(
+                f"G{index}",
+                ContainerSize.SIZE_20,
+                1,
+                business_type=BusinessType.EXPORT,
+                voyage_id="V-SAME",
+            )
+            for index in range(6)
+        ]
+        config = Stage1LNSConfig(random_seed=23)
+        first_assigner = Stage1YardAreaAssigner(config=config)
+        first_pairs = first_assigner._mark_simultaneous_loading_conflicts(groups)
+
+        fresh_groups = [
+            make_group(
+                f"G{index}",
+                ContainerSize.SIZE_20,
+                1,
+                business_type=BusinessType.EXPORT,
+                voyage_id="V-SAME",
+            )
+            for index in range(6)
+        ]
+        second_assigner = Stage1YardAreaAssigner(config=config)
+        second_pairs = second_assigner._mark_simultaneous_loading_conflicts(fresh_groups)
+
+        self.assertEqual(first_pairs, second_pairs)
+        self.assertEqual(len(first_pairs), 3)
+        for group in groups:
+            self.assertEqual(len(simultaneous_loading_conflict_group_ids(group)), 1)
+            self.assertEqual(group.group_attributes[SIMULTANEOUS_LOADING_SAFETY_GAP_BAYS], 4)
+
+    def test_stage1_penalizes_simultaneous_loading_pairs_in_same_area(self):
+        first = make_group(
+            "GA",
+            ContainerSize.SIZE_20,
+            1,
+            business_type=BusinessType.EXPORT,
+        )
+        second = make_group(
+            "GB",
+            ContainerSize.SIZE_20,
+            1,
+            business_type=BusinessType.EXPORT,
+        )
+        add_simultaneous_loading_conflict(first, "GB", "PAIR-1", 4)
+        add_simultaneous_loading_conflict(second, "GA", "PAIR-1", 4)
+        assigner = Stage1YardAreaAssigner()
+        group_by_id = {first.group_id: first, second.group_id: second}
+        same_area = Stage1Solution(
+            placements_by_group={
+                "GA": [Stage1Placement("GA", "A", 1)],
+                "GB": [Stage1Placement("GB", "A", 1)],
+            }
+        )
+        separate_area = Stage1Solution(
+            placements_by_group={
+                "GA": [Stage1Placement("GA", "A", 1)],
+                "GB": [Stage1Placement("GB", "B", 1)],
+            }
+        )
+
+        self.assertGreater(
+            assigner._simultaneous_loading_same_area_cost(same_area, group_by_id),
+            assigner._simultaneous_loading_same_area_cost(separate_area, group_by_id),
+        )
 
 
 if __name__ == "__main__":

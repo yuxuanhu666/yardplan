@@ -472,15 +472,22 @@ class YardPlanner:
         result.metrics["range_plan"] = range_plan
         result.metrics["data"] = range_plan["data"]
         result.metrics["vessels"] = vessels or {}
+        result.metrics["stage1_convergence"] = list(
+            getattr(self.allocation_engine, "last_stage1_convergence", [])
+        )
+        result.metrics["stage2_progress"] = list(
+            getattr(self.allocation_engine, "last_stage2_progress", [])
+        )
 
         self.formatter.print_summary(result)
+        score = score_yard_plan(
+            result,
+            yard_areas=yard_areas,
+            workload_snapshot=workload_snapshot,
+            vessels=vessels,
+        )
+        result.metrics["score"] = score
         if print_score:
-            score = score_yard_plan(
-                result,
-                yard_areas=yard_areas,
-                workload_snapshot=workload_snapshot,
-                vessels=vessels,
-            )
             print(format_score_report(score, indent="  "))
         return result
 
@@ -546,15 +553,22 @@ class YardPlanner:
         result.metrics["range_plan"] = range_plan
         result.metrics["data"] = range_plan["data"]
         result.metrics["vessels"] = vessels or {}
+        result.metrics["stage1_convergence"] = list(
+            getattr(self.allocation_engine, "last_stage1_convergence", [])
+        )
+        result.metrics["stage2_progress"] = list(
+            getattr(self.allocation_engine, "last_stage2_progress", [])
+        )
 
         self.formatter.print_summary(result)
+        score = score_yard_plan(
+            result,
+            yard_areas=yard_areas,
+            workload_snapshot=workload_snapshot,
+            vessels=vessels,
+        )
+        result.metrics["score"] = score
         if print_score:
-            score = score_yard_plan(
-                result,
-                yard_areas=yard_areas,
-                workload_snapshot=workload_snapshot,
-                vessels=vessels,
-            )
             print(format_score_report(score, indent="  "))
         return result
 

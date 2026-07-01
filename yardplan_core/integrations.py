@@ -70,6 +70,13 @@ class YardSpaceAdapter:
                 stack_dict,
                 sorted_bay_idxs,
             )
+            occupied_tiers_by_bay: Dict[int, int] = {
+                bay_idx: sum(
+                    YardSpaceAdapter._occupied_tier_count(stack_info)
+                    for _stack_key, stack_info in stacks
+                )
+                for bay_idx, stacks in bay_groups.items()
+            }
 
             for bay_idx in sorted_bay_idxs:
                 stacks_in_bay = bay_groups[bay_idx]
@@ -103,6 +110,8 @@ class YardSpaceAdapter:
                                 "bay_number": bay_number,
                                 "stack_index": int(stack_key[2]),
                                 "tiers": tiers,
+                                "column_occupied_tiers": YardSpaceAdapter._occupied_tier_count(stack_info),
+                                "segment_occupied_tiers": occupied_tiers_by_bay.get(bay_number, 0),
                             }
                         )
 
@@ -163,6 +172,11 @@ class YardSpaceAdapter:
                                 "stack_index": stack_index,
                                 "tiers": tiers,
                                 "is_edge_pair": is_edge,
+                                "column_occupied_tiers": YardSpaceAdapter._occupied_tier_count(stack_info),
+                                "segment_occupied_tiers": sum(
+                                    occupied_tiers_by_bay.get(bay, 0)
+                                    for bay in pair_bays
+                                ),
                             }
                         )
 
@@ -292,6 +306,17 @@ class YardSpaceAdapter:
                 break
             tiers.append(tier)
         return tiers
+
+    @staticmethod
+    def _occupied_tier_count(stack_info: Dict[str, Any]) -> int:
+        top = int(stack_info.get("top_occupied_tier") or 0)
+        if top > 0:
+            return top
+        count = 0
+        for tier_data in (stack_info.get("tiers") or {}).values():
+            if tier_data.get("occupant"):
+                count += 1
+        return count
 
     @staticmethod
     def _remaining_large_tiers(

@@ -124,6 +124,7 @@ __all__ = [
 if __name__ == "__main__":
     import argparse
     from datetime import datetime
+    from yardplan_score import format_score_report
 
     default_start = datetime.fromisoformat("2026-03-25T00:00:00")
     default_end = datetime.fromisoformat("2026-04-10T00:00:00")
@@ -174,13 +175,33 @@ if __name__ == "__main__":
         type=str,
         help="Visualization output path, e.g. outputs/line15525576.png.",
     )
+    parser.add_argument(
+        "--plot-convergence",
+        dest="plot_convergence",
+        action="store_true",
+        default=False,
+        help="Save Stage1 convergence and Stage2 greedy progress chart.",
+    )
+    parser.add_argument(
+        "--no-plot-convergence",
+        dest="plot_convergence",
+        action="store_false",
+        help="Skip convergence/progress chart generation.",
+    )
+    parser.add_argument(
+        "--convergence-path",
+        type=str,
+        default="outputs/convergence.svg",
+        help="Convergence chart output path, e.g. outputs/convergence.svg.",
+    )
     args = parser.parse_args()
 
     plan_start_time = datetime.fromisoformat(args.start) if args.start else default_start
     plan_end_time = datetime.fromisoformat(args.end) if args.end else default_end
 
+    result = None
     if args.line_keys:
-        run_plan(
+        result = run_plan(
             line_keys=args.line_keys,
             type=args.plan_type,
             save_visualization=args.visualize,
@@ -190,7 +211,7 @@ if __name__ == "__main__":
             print_score=True,
         )
     else:
-        run_plan(
+        result = run_plan(
             vessel_key=args.vessel_key or 15623707,
             type=args.plan_type,
             save_visualization=args.visualize,
@@ -199,3 +220,18 @@ if __name__ == "__main__":
             plan_end_time=plan_end_time,
             print_score=True,
         )
+
+    score = getattr(result, "metrics", {}).get("score") if result is not None else None
+    if score:
+        print("\nFinal score:")
+        print(format_score_report(score, indent="  "))
+
+    if args.plot_convergence and result is not None:
+        from yardplan_convergence_plot import plot_convergence_report
+
+        output = plot_convergence_report(
+            result,
+            args.convergence_path,
+            title="Yard Planning Algorithm Progress",
+        )
+        print(f"\nConvergence chart saved to: {output}")

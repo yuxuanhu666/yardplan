@@ -1,4 +1,2 @@
-# Requires a system SCIP installation discoverable by PySCIPOpt.
-PySCIPOpt
 matplotlib
 requests
