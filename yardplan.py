@@ -123,6 +123,7 @@ __all__ = [
 
 if __name__ == "__main__":
     import argparse
+    import json
     from datetime import datetime
     from yardplan_score import format_score_report
 
@@ -131,6 +132,11 @@ if __name__ == "__main__":
 
     # 航次 YH25004（远航888）：ETA 2025-12-21 16:00，ETD 2025-12-25 16:00
     parser = argparse.ArgumentParser(description="Local yard planning test runner")
+    parser.add_argument(
+        "--request-json",
+        type=str,
+        help="Path to a JSON file using the same body as the FastAPI endpoint.",
+    )
     target = parser.add_mutually_exclusive_group()
     target.add_argument(
         "--line-key",
@@ -196,30 +202,48 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    plan_start_time = datetime.fromisoformat(args.start) if args.start else default_start
-    plan_end_time = datetime.fromisoformat(args.end) if args.end else default_end
-
     result = None
-    if args.line_keys:
+    if args.request_json:
+        with open(args.request_json, "r", encoding="utf-8") as request_file:
+            request_body = json.load(request_file)
+        if not isinstance(request_body, dict):
+            raise ValueError("The request JSON root must be an object")
         result = run_plan(
-            line_keys=args.line_keys,
-            type=args.plan_type,
+            vessel_line_keys=request_body.get("vesselLineKeyList"),
+            vessel_visit_keys=request_body.get("vesselVisitKeyList"),
+            import_info=request_body.get("importInfo"),
+            export_info=request_body.get("exportInfo"),
+            is_auto_group=request_body.get("isAutoGroup"),
+            is_auto_range=request_body.get("isAutoRange"),
             save_visualization=args.visualize,
             visualization_path=args.visualization_path,
-            plan_start_time=plan_start_time,
-            plan_end_time=plan_end_time,
             print_score=True,
         )
     else:
-        result = run_plan(
-            vessel_key=args.vessel_key or 15623707,
-            type=args.plan_type,
-            save_visualization=args.visualize,
-            visualization_path=args.visualization_path,
-            plan_start_time=plan_start_time,
-            plan_end_time=plan_end_time,
-            print_score=True,
+        plan_start_time = (
+            datetime.fromisoformat(args.start) if args.start else default_start
         )
+        plan_end_time = datetime.fromisoformat(args.end) if args.end else default_end
+        if args.line_keys:
+            result = run_plan(
+                line_keys=args.line_keys,
+                type=args.plan_type,
+                save_visualization=args.visualize,
+                visualization_path=args.visualization_path,
+                plan_start_time=plan_start_time,
+                plan_end_time=plan_end_time,
+                print_score=True,
+            )
+        else:
+            result = run_plan(
+                vessel_key=args.vessel_key or 15623707,
+                type=args.plan_type,
+                save_visualization=args.visualize,
+                visualization_path=args.visualization_path,
+                plan_start_time=plan_start_time,
+                plan_end_time=plan_end_time,
+                print_score=True,
+            )
 
     score = getattr(result, "metrics", {}).get("score") if result is not None else None
     if score:

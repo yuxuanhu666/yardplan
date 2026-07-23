@@ -1,0 +1,20 @@
+{
+  "vesselVisitKeyList": [18321497],
+  "importInfo": {
+    "blockIdList": [],
+    "cnt20Ft": 0,
+    "cnt40Ft": 0
+  },
+  "exportInfo": {
+    "blockIdList": ["B02"],
+    "podList": [
+      {
+        "pod": "CNXIA",
+        "cnt20Ft": 3,
+        "cnt40Ft": 0
+      }
+    ]
+  },
+  "isAutoGroup": 1,
+  "isAutoRange": 0
+}
