@@ -43,12 +43,7 @@ class ColumnDemandConverter:
         weight_class: WeightClass,
         container_type: ContainerType,
     ) -> int:
-        if container_type == ContainerType.REEFER:
-            return 3
-        if weight_class == WeightClass.HEAVY:
-            return 4
-        if container_type in (ContainerType.OPEN_TOP, ContainerType.FLAT_RACK):
-            return 2
+        del weight_class, container_type
         return self.max_tiers
 
     def convert_group(self, group: AllocationGroup) -> int:
